@@ -95,6 +95,52 @@ Authorization: Bearer <WEKNORA_SPACE_API_KEY>
 
 Cloudflare 负责公网入口鉴权，WeKnora API Key 负责用户/空间权限控制；两层可以同时启用。
 
+## WorkBuddy 配置示例
+
+WorkBuddy 支持用户级 `~/.workbuddy/mcp.json` 和项目级
+`<项目目录>/.workbuddy/mcp.json`。以下示例通过环境变量保存凭据：
+
+```json
+{
+  "mcpServers": {
+    "weknora": {
+      "type": "http",
+      "url": "https://kb.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${WEKNORA_SPACE_API_KEY}",
+        "CF-Access-Client-Id": "${CF_ACCESS_CLIENT_ID}",
+        "CF-Access-Client-Secret": "${CF_ACCESS_CLIENT_SECRET}"
+      }
+    }
+  }
+}
+```
+
+将 `url` 替换为实际 MCP 地址，并在启动 WorkBuddy 前设置三个环境变量。
+如果没有启用 Cloudflare Access Service Token，删除两个 `CF-Access-*` 请求头即可。
+保存配置后，在 WorkBuddy 的 MCP 页面确认服务状态为绿色。
+
+参考：[WorkBuddy MCP 配置说明](https://www.codebuddy.cn/docs/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/MCP-Guide)、
+[HTTP MCP 配置字段](https://www.codebuddy.cn/docs/cli/mcp)。
+
+## Codex 配置示例
+
+在 `~/.codex/config.toml` 中加入：
+
+```toml
+[mcp_servers.weknora]
+url = "https://kb.example.com/mcp"
+bearer_token_env_var = "WEKNORA_SPACE_API_KEY"
+env_http_headers = { "CF-Access-Client-Id" = "CF_ACCESS_CLIENT_ID", "CF-Access-Client-Secret" = "CF_ACCESS_CLIENT_SECRET" }
+```
+
+Codex 会从 `WEKNORA_SPACE_API_KEY` 读取 Bearer Token，并从另外两个环境变量
+生成 Cloudflare Access 请求头。未启用 Cloudflare Access Service Token 时，删除
+`env_http_headers` 这一行即可。设置环境变量后重启 Codex，再通过 `codex mcp list`
+确认服务已加载。
+
+不建议把 WeKnora API Key 或 Cloudflare Client Secret 明文提交到配置仓库。
+
 ## 环境变量
 
 | 变量 | 推荐值 | 说明 |

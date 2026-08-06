@@ -36,7 +36,14 @@ setup(
     long_description=read_readme(),
     long_description_content_type="text/markdown",
     url="https://github.com/mwe-support/weknora-mcp-dispatch",
-    py_modules=["weknora_mcp_server", "main", "run_server", "run", "test_module"],
+    py_modules=[
+        "weknora_mcp_server",
+        "upload_paths",
+        "main",
+        "run_server",
+        "run",
+        "test_module",
+    ],
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
