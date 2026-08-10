@@ -25,32 +25,40 @@ class ResolveUploadFilePathTest(unittest.TestCase):
 
     def test_network_transport_blocks_path_outside_cwd(self):
         os.environ["MCP_TRANSPORT"] = "http"
+        previous_cwd = os.getcwd()
         with tempfile.TemporaryDirectory() as tmp:
-            os.chdir(tmp)
-            allowed = os.path.join(tmp, "note.txt")
-            with open(allowed, "w", encoding="utf-8") as handle:
-                handle.write("ok")
+            try:
+                os.chdir(tmp)
+                allowed = os.path.join(tmp, "note.txt")
+                with open(allowed, "w", encoding="utf-8") as handle:
+                    handle.write("ok")
 
-            resolved = resolve_upload_file_path("note.txt")
-            self.assertEqual(resolved, os.path.realpath(allowed))
+                resolved = resolve_upload_file_path("note.txt")
+                self.assertEqual(resolved, os.path.realpath(allowed))
 
-            with self.assertRaises(ValueError):
-                resolve_upload_file_path("/etc/passwd")
+                with self.assertRaises(ValueError):
+                    resolve_upload_file_path("/etc/passwd")
+            finally:
+                os.chdir(previous_cwd)
 
     def test_active_transport_without_env_blocks_path_outside_cwd(self):
         """CLI --transport http sets active transport without MCP_TRANSPORT env."""
         set_active_transport("http")
+        previous_cwd = os.getcwd()
         with tempfile.TemporaryDirectory() as tmp:
-            os.chdir(tmp)
-            allowed = os.path.join(tmp, "note.txt")
-            with open(allowed, "w", encoding="utf-8") as handle:
-                handle.write("ok")
+            try:
+                os.chdir(tmp)
+                allowed = os.path.join(tmp, "note.txt")
+                with open(allowed, "w", encoding="utf-8") as handle:
+                    handle.write("ok")
 
-            resolved = resolve_upload_file_path("note.txt")
-            self.assertEqual(resolved, os.path.realpath(allowed))
+                resolved = resolve_upload_file_path("note.txt")
+                self.assertEqual(resolved, os.path.realpath(allowed))
 
-            with self.assertRaises(ValueError):
-                resolve_upload_file_path("/etc/passwd")
+                with self.assertRaises(ValueError):
+                    resolve_upload_file_path("/etc/passwd")
+            finally:
+                os.chdir(previous_cwd)
 
     def test_explicit_allowed_roots(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -7,6 +7,15 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-10
+
+### 变更
+- 同步 WeKnora v0.7.2 官方 MCP Server 1.1.1 与 MCP Python SDK 2.x 高层 API。
+- 重新实现请求级 WeKnora API Key 鉴权和多租户上下文隔离。
+- 让同步工具工作线程继承请求身份，并在请求结束后关闭其 HTTP 会话。
+- 将只读策略适配到 MCP 2.x 工具注册表。
+- 保留 WorkBuddy、Codex 和生产 Compose 配置示例。
+
 ### 新增
 - 新增 `create_knowledge_from_text` 工具：通过手动 Markdown 文本创建知识条目，调用既有 `/knowledge-bases/{id}/knowledge/manual` 接口，补齐 #323 中"文本"部分。默认 `status="publish"`，创建后即进入解析/索引流程、可被检索；可传 `status="draft"` 仅保存不索引。
 - README 工具清单补列既有的 `create_knowledge_from_file`。

@@ -45,15 +45,20 @@ def check_environment_variables():
     """检查环境变量配置"""
     base_url = os.getenv("WEKNORA_BASE_URL")
     api_key = os.getenv("WEKNORA_API_KEY")
+    auth_mode = os.getenv("MCP_AUTH_MODE", "shared_secret").strip().lower()
 
     print("=== WeKnora MCP Server 环境检查 ===", file=sys.stderr)
     print(f"Base URL: {base_url or 'http://localhost:8080/api/v1 (默认)'}", file=sys.stderr)
-    print(f"API Key: {'已设置' if api_key else '未设置 (警告)'}", file=sys.stderr)
+    print(f"MCP Auth Mode: {auth_mode}", file=sys.stderr)
+    print(
+        f"Static API Key: {'已设置' if api_key else '未设置'}",
+        file=sys.stderr,
+    )
 
     if not base_url:
         print("提示: 可以设置 WEKNORA_BASE_URL 环境变量", file=sys.stderr)
 
-    if not api_key:
+    if not api_key and auth_mode != "weknora_api_key":
         print("警告: 建议设置 WEKNORA_API_KEY 环境变量", file=sys.stderr)
 
     print("=" * 40, file=sys.stderr)
@@ -73,8 +78,9 @@ def parse_arguments():
   
 环境变量:
   WEKNORA_BASE_URL       WeKnora API 基础 URL (默认: http://localhost:8080/api/v1)
-  WEKNORA_API_KEY        WeKnora API 密钥
-  MCP_SERVER_AUTH_TOKEN  SSE/HTTP 传输必填，客户端通过 Authorization: Bearer 传递
+  MCP_AUTH_MODE          shared_secret 或 weknora_api_key
+  WEKNORA_API_KEY        stdio/shared_secret 模式的静态 WeKnora API 密钥
+  MCP_SERVER_AUTH_TOKEN  shared_secret 网络传输的 Bearer Token
         """,
     )
 
@@ -85,7 +91,7 @@ def parse_arguments():
     parser.add_argument("--verbose", "-v", action="store_true", help="启用详细日志输出")
 
     parser.add_argument(
-        "--version", action="version", version="WeKnora MCP Server 1.1.1"
+        "--version", action="version", version="WeKnora MCP Dispatch 0.2.0"
     )
 
     parser.add_argument(

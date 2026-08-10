@@ -7,7 +7,9 @@ A Model Context Protocol server that provides access to the WeKnora knowledge ma
 
 import argparse
 import asyncio
+import contextvars
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -15,7 +17,8 @@ import re
 import secrets
 import sys
 import threading
-from typing import Any, Dict
+import time
+from typing import Any, Awaitable, Callable, Dict
 
 import urllib3
 import requests
@@ -30,6 +33,64 @@ logger = logging.getLogger(__name__)
 # Configuration - Load from environment variables with defaults
 WEKNORA_BASE_URL = os.getenv("WEKNORA_BASE_URL", "http://localhost:8080/api/v1")
 WEKNORA_API_KEY = os.getenv("WEKNORA_API_KEY", "")
+MCP_READ_ONLY = os.getenv("MCP_READ_ONLY", "false").lower() == "true"
+AUTH_MODE_SHARED_SECRET = "shared_secret"
+AUTH_MODE_WEKNORA_API_KEY = "weknora_api_key"
+
+
+def _normalize_path_prefix(path_prefix: str) -> str:
+    path_prefix = (path_prefix or "/").strip()
+    if not path_prefix.startswith("/"):
+        path_prefix = f"/{path_prefix}"
+    return path_prefix.rstrip("/") or "/"
+
+
+MCP_AUTH_MODE = os.getenv("MCP_AUTH_MODE", AUTH_MODE_SHARED_SECRET).strip().lower()
+MCP_HTTP_PATH = _normalize_path_prefix(os.getenv("MCP_HTTP_PATH", "/mcp"))
+try:
+    MCP_API_KEY_VALIDATION_TTL_SECONDS = max(
+        1, int(os.getenv("MCP_API_KEY_VALIDATION_TTL_SECONDS", "60"))
+    )
+except ValueError:
+    logger.warning(
+        "MCP_API_KEY_VALIDATION_TTL_SECONDS is invalid; falling back to 60s."
+    )
+    MCP_API_KEY_VALIDATION_TTL_SECONDS = 60
+try:
+    MCP_API_KEY_VALIDATION_CACHE_MAX_ENTRIES = max(
+        16, int(os.getenv("MCP_API_KEY_VALIDATION_CACHE_MAX_ENTRIES", "2048"))
+    )
+except ValueError:
+    logger.warning(
+        "MCP_API_KEY_VALIDATION_CACHE_MAX_ENTRIES is invalid; falling back to 2048."
+    )
+    MCP_API_KEY_VALIDATION_CACHE_MAX_ENTRIES = 2048
+try:
+    MCP_API_KEY_VALIDATION_MAX_CONCURRENCY = max(
+        1, int(os.getenv("MCP_API_KEY_VALIDATION_MAX_CONCURRENCY", "16"))
+    )
+except ValueError:
+    logger.warning(
+        "MCP_API_KEY_VALIDATION_MAX_CONCURRENCY is invalid; falling back to 16."
+    )
+    MCP_API_KEY_VALIDATION_MAX_CONCURRENCY = 16
+
+READ_ONLY_TOOL_NAMES = frozenset(
+    {
+        "list_knowledge_bases",
+        "list_shared_knowledge_bases",
+        "get_knowledge_base",
+        "hybrid_search",
+        "list_knowledge",
+        "get_knowledge",
+        "list_chunks",
+        "list_agents",
+        "get_agent",
+        "wiki_search",
+        "wiki_read_page",
+        "wiki_index_view",
+    }
+)
 # Chat SSE read timeout in seconds. LLM responses can be slow; default 300s.
 try:
     WEKNORA_CHAT_TIMEOUT = int(os.getenv("WEKNORA_CHAT_TIMEOUT", "300"))
@@ -47,8 +108,29 @@ def network_transport_auth_token() -> str:
     return os.getenv("MCP_SERVER_AUTH_TOKEN", "").strip()
 
 
+def network_transport_auth_mode() -> str:
+    """Return the configured network authentication mode."""
+    return os.getenv("MCP_AUTH_MODE", MCP_AUTH_MODE).strip().lower()
+
+
 def require_network_transport_auth(transport: str) -> str:
-    """SSE/HTTP must not start without a configured auth token."""
+    """Validate network authentication configuration and return a legacy token."""
+    auth_mode = network_transport_auth_mode()
+    if auth_mode not in {AUTH_MODE_SHARED_SECRET, AUTH_MODE_WEKNORA_API_KEY}:
+        logger.error(
+            "Unsupported MCP_AUTH_MODE=%r; use shared_secret or weknora_api_key.",
+            auth_mode,
+        )
+        sys.exit(1)
+    if auth_mode == AUTH_MODE_WEKNORA_API_KEY:
+        if transport == "sse":
+            logger.error(
+                "MCP_AUTH_MODE=weknora_api_key is only supported by the stateless "
+                "Streamable HTTP transport."
+            )
+            sys.exit(1)
+        return ""
+
     token = network_transport_auth_token()
     if transport in ("sse", "http") and not token:
         logger.error(
@@ -61,12 +143,152 @@ def require_network_transport_auth(transport: str) -> str:
     return token
 
 
-class MCPAuthMiddleware:
-    """ASGI middleware that gates network MCP transports behind a shared secret."""
+class RequestAuthContext:
+    """Mutable request state that survives child tasks and worker-thread hops."""
 
-    def __init__(self, app, token: str):
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.client: "WeKnoraClient | None" = None
+        self.lock = threading.Lock()
+
+
+_REQUEST_AUTH_CONTEXT: contextvars.ContextVar[RequestAuthContext | None] = (
+    contextvars.ContextVar("weknora_request_auth_context", default=None)
+)
+_API_KEY_VALIDATION_CACHE: dict[str, tuple[float, bool]] = {}
+_API_KEY_VALIDATION_CACHE_LOCK = threading.Lock()
+_API_KEY_VALIDATION_SEMAPHORE = asyncio.Semaphore(
+    MCP_API_KEY_VALIDATION_MAX_CONCURRENCY
+)
+
+
+def current_request_api_key() -> str:
+    """Return the WeKnora API key bound to the current request task."""
+    context = _REQUEST_AUTH_CONTEXT.get()
+    return context.api_key if context else ""
+
+
+def bind_request_api_key(api_key: str):
+    """Bind an API key to the current async context and return its reset token."""
+    return _REQUEST_AUTH_CONTEXT.set(RequestAuthContext(api_key))
+
+
+def reset_request_api_key(token) -> None:
+    """Restore the previous request API key context."""
+    _REQUEST_AUTH_CONTEXT.reset(token)
+
+
+def _api_key_fingerprint(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+
+def _cache_api_key_validation_result(
+    fingerprint: str, expires_at: float, valid: bool
+) -> None:
+    """Insert a bounded cache entry without retaining raw credentials."""
+    now = time.monotonic()
+    with _API_KEY_VALIDATION_CACHE_LOCK:
+        if len(_API_KEY_VALIDATION_CACHE) >= MCP_API_KEY_VALIDATION_CACHE_MAX_ENTRIES:
+            expired = [
+                key
+                for key, (expiry, _) in _API_KEY_VALIDATION_CACHE.items()
+                if expiry <= now
+            ]
+            for key in expired:
+                _API_KEY_VALIDATION_CACHE.pop(key, None)
+        while len(_API_KEY_VALIDATION_CACHE) >= MCP_API_KEY_VALIDATION_CACHE_MAX_ENTRIES:
+            _API_KEY_VALIDATION_CACHE.pop(next(iter(_API_KEY_VALIDATION_CACHE)))
+        _API_KEY_VALIDATION_CACHE[fingerprint] = (expires_at, valid)
+
+
+def _validate_weknora_api_key_sync(api_key: str) -> bool | None:
+    """Validate one key with a safe read-only request to WeKnora."""
+    fingerprint = _api_key_fingerprint(api_key)
+    now = time.monotonic()
+    with _API_KEY_VALIDATION_CACHE_LOCK:
+        cached = _API_KEY_VALIDATION_CACHE.get(fingerprint)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    try:
+        response = requests.get(
+            f"{WEKNORA_BASE_URL}/knowledge-bases",
+            headers={"X-API-Key": api_key, "Accept": "application/json"},
+            timeout=(3, 10),
+            verify=os.getenv("WEKNORA_VERIFY_SSL", "true").lower() != "false",
+        )
+    except RequestException as exc:
+        logger.error("WeKnora API key validation is temporarily unavailable: %s", exc)
+        return None
+
+    if 200 <= response.status_code < 300:
+        valid = True
+    elif response.status_code in {408, 425, 429}:
+        logger.warning(
+            "WeKnora API key validation was temporarily limited with status %d",
+            response.status_code,
+        )
+        return None
+    elif 400 <= response.status_code < 500:
+        valid = False
+    else:
+        logger.error(
+            "WeKnora API key validation returned upstream status %d",
+            response.status_code,
+        )
+        return None
+
+    ttl = (
+        MCP_API_KEY_VALIDATION_TTL_SECONDS
+        if valid
+        else min(10, MCP_API_KEY_VALIDATION_TTL_SECONDS)
+    )
+    _cache_api_key_validation_result(fingerprint, now + ttl, valid)
+    return valid
+
+
+async def validate_weknora_api_key(api_key: str) -> bool | None:
+    """Validate a WeKnora API key without blocking the event loop."""
+    try:
+        await asyncio.wait_for(_API_KEY_VALIDATION_SEMAPHORE.acquire(), timeout=1.0)
+    except TimeoutError:
+        logger.warning("WeKnora API key validation concurrency limit reached")
+        return None
+    try:
+        return await asyncio.to_thread(_validate_weknora_api_key_sync, api_key)
+    finally:
+        _API_KEY_VALIDATION_SEMAPHORE.release()
+
+
+class MCPAuthMiddleware:
+    """Authenticate MCP requests using a shared secret or a WeKnora API key."""
+
+    def __init__(
+        self,
+        app,
+        token: str,
+        auth_mode: str = AUTH_MODE_SHARED_SECRET,
+        api_key_validator: Callable[[str], Awaitable[bool | None]] | None = None,
+    ):
         self.app = app
         self.token = token
+        self.auth_mode = auth_mode
+        self.api_key_validator = api_key_validator or validate_weknora_api_key
+
+    @staticmethod
+    async def _send_error(send, status: int, error: str) -> None:
+        body = json.dumps({"error": error}, separators=(",", ":")).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    [b"content-type", b"application/json"],
+                    [b"www-authenticate", b"Bearer"],
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http":
@@ -81,22 +303,40 @@ class MCPAuthMiddleware:
         auth = headers.get("authorization", "")
         if auth.lower().startswith("bearer "):
             provided = auth[7:].strip()
-        elif "x-mcp-auth-token" in headers:
+        elif self.auth_mode == AUTH_MODE_SHARED_SECRET and "x-mcp-auth-token" in headers:
             provided = headers["x-mcp-auth-token"]
 
-        if not provided or not secrets.compare_digest(provided, self.token):
-            body = b'{"error":"unauthorized"}'
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": 401,
-                    "headers": [[b"content-type", b"application/json"]],
-                }
-            )
-            await send({"type": "http.response.body", "body": body})
+        if not provided:
+            await self._send_error(send, 401, "missing_api_key")
             return
 
-        await self.app(scope, receive, send)
+        if self.auth_mode == AUTH_MODE_SHARED_SECRET:
+            if not self.token or not secrets.compare_digest(provided, self.token):
+                await self._send_error(send, 401, "unauthorized")
+                return
+            await self.app(scope, receive, send)
+            return
+
+        if self.auth_mode != AUTH_MODE_WEKNORA_API_KEY:
+            await self._send_error(send, 500, "invalid_server_auth_mode")
+            return
+
+        validation = await self.api_key_validator(provided)
+        if validation is None:
+            await self._send_error(send, 503, "authentication_service_unavailable")
+            return
+        if not validation:
+            await self._send_error(send, 403, "invalid_or_unscoped_api_key")
+            return
+
+        context_token = bind_request_api_key(provided)
+        request_context = _REQUEST_AUTH_CONTEXT.get()
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            if request_context and request_context.client:
+                request_context.client.close()
+            reset_request_api_key(context_token)
 
 
 def _normalize_kb_entries(resp: object) -> list[Dict]:
@@ -142,6 +382,8 @@ class WeKnoraClient:
         # MCP 2.x runs sync @mcp.tool() handlers on worker threads; use a
         # thread-local Session because requests.Session is not thread-safe.
         self._session_local = threading.local()
+        self._sessions: set[requests.Session] = set()
+        self._sessions_lock = threading.Lock()
 
     def _new_session(self) -> requests.Session:
         session = requests.Session()
@@ -152,6 +394,8 @@ class WeKnoraClient:
                 "Content-Type": "application/json",
             }
         )
+        with self._sessions_lock:
+            self._sessions.add(session)
         return session
 
     @property
@@ -159,6 +403,16 @@ class WeKnoraClient:
         if not getattr(self._session_local, "session", None):
             self._session_local.session = self._new_session()
         return self._session_local.session
+
+    def close(self) -> None:
+        """Close every worker-thread session created for this request client."""
+        with self._sessions_lock:
+            sessions = list(self._sessions)
+            self._sessions.clear()
+        for session in sessions:
+            session.close()
+        if getattr(self._session_local, "session", None) in sessions:
+            self._session_local.session = None
 
     def _request(self, method: str, endpoint: str, **kwargs) -> Dict[str, Any]:
         """Make a request to the WeKnora API
@@ -612,9 +866,35 @@ class WeKnoraClient:
 # Initialize MCP server instance (mcp 2.x high-level API).
 # MCPServer (formerly FastMCP) builds input schemas from function type hints
 # and serializes plain return values automatically.
-mcp = MCPServer("weknora-server", version="1.1.1")
-# Initialize WeKnora API client with configuration
-client = WeKnoraClient(WEKNORA_BASE_URL, WEKNORA_API_KEY)
+mcp = MCPServer("weknora-server", version="0.2.0")
+
+# Shared-secret and stdio transports retain the deployment API key. Dynamic
+# HTTP mode never falls back to it, so a lost request context fails closed.
+_STATIC_CLIENT = WeKnoraClient(WEKNORA_BASE_URL, WEKNORA_API_KEY)
+
+
+def weknora_client_for_request() -> WeKnoraClient:
+    """Return a client scoped to the active MCP request credential."""
+    context = _REQUEST_AUTH_CONTEXT.get()
+    if context:
+        with context.lock:
+            if context.client is None:
+                context.client = WeKnoraClient(WEKNORA_BASE_URL, context.api_key)
+            return context.client
+
+    if network_transport_auth_mode() == AUTH_MODE_WEKNORA_API_KEY:
+        raise PermissionError("No request-scoped WeKnora API key is available")
+    return _STATIC_CLIENT
+
+
+class RequestScopedClientProxy:
+    """Resolve each client method through the current request context."""
+
+    def __getattr__(self, name: str):
+        return getattr(weknora_client_for_request(), name)
+
+
+client = RequestScopedClientProxy()
 
 
 # ---------------------------------------------------------------------------
@@ -874,8 +1154,8 @@ async def chat(
         knowledge_base_ids=kb_ids,
         web_search_enabled=web_search_enabled,
     )
-    # get_running_loop() is the correct API inside async functions.
-    return await asyncio.get_running_loop().run_in_executor(None, fn)
+    # asyncio.to_thread propagates the request ContextVar into the worker.
+    return await asyncio.to_thread(fn)
 
 
 @mcp.tool()
@@ -946,7 +1226,7 @@ async def agent_chat(
         knowledge_base_ids=kb_ids,
         web_search_enabled=web_search_enabled,
     )
-    return await asyncio.get_running_loop().run_in_executor(None, fn)
+    return await asyncio.to_thread(fn)
 
 
 @mcp.tool()
@@ -1017,9 +1297,19 @@ def wiki_index_view(kb_id: str, limit: int = 50) -> dict:
 # ---------------------------------------------------------------------------
 
 
+async def _apply_read_only_policy(server: MCPServer = mcp) -> None:
+    """Hide every mutating/high-level chat tool in read-only deployments."""
+    if not MCP_READ_ONLY:
+        return
+    for tool in await server.list_tools():
+        if tool.name not in READ_ONLY_TOOL_NAMES:
+            server.remove_tool(tool.name)
+
+
 async def run_stdio():
     """Run the MCP server using stdio transport."""
     set_active_transport("stdio")
+    await _apply_read_only_policy()
     await mcp.run_stdio_async()
 
 
@@ -1027,6 +1317,8 @@ async def run_sse(host: str, port: int):
     """Run the MCP server using SSE transport (legacy MCP clients)."""
     set_active_transport("sse")
     auth_token = require_network_transport_auth("sse")
+    auth_mode = network_transport_auth_mode()
+    await _apply_read_only_policy()
     try:
         import uvicorn
     except ImportError as e:
@@ -1037,6 +1329,7 @@ async def run_sse(host: str, port: int):
     starlette_app = MCPAuthMiddleware(
         mcp.sse_app(host=host, message_path=SSE_MESSAGE_PATH),
         auth_token,
+        auth_mode=auth_mode,
     )
 
     logger.info("Starting SSE MCP server on %s:%d", host, port)
@@ -1051,6 +1344,8 @@ async def run_http(host: str, port: int):
     """Run the MCP server using Streamable HTTP transport (MCP 2025-03-26 spec)."""
     set_active_transport("http")
     auth_token = require_network_transport_auth("http")
+    auth_mode = network_transport_auth_mode()
+    await _apply_read_only_policy()
     try:
         import uvicorn
     except ImportError as e:
@@ -1059,12 +1354,17 @@ async def run_http(host: str, port: int):
         ) from e
 
     starlette_app = MCPAuthMiddleware(
-        mcp.streamable_http_app(host=host, stateless_http=STREAMABLE_HTTP_STATELESS),
+        mcp.streamable_http_app(
+            host=host,
+            streamable_http_path=MCP_HTTP_PATH,
+            stateless_http=STREAMABLE_HTTP_STATELESS,
+        ),
         auth_token,
+        auth_mode=auth_mode,
     )
 
     logger.info("Starting Streamable HTTP MCP server on %s:%d", host, port)
-    logger.info("MCP endpoint:  http://%s:%d/mcp", host, port)
+    logger.info("MCP endpoint:  http://%s:%d%s", host, port, MCP_HTTP_PATH)
     config = uvicorn.Config(starlette_app, host=host, port=port, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()

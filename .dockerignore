@@ -1,0 +1,17 @@
+.git
+.github
+.venv
+.pytest_cache
+.artifacts
+__pycache__
+*.py[cod]
+*.egg-info
+build
+dist
+.env
+.env.*
+*.pem
+*.key
+*.crt
+tests
+test_*.py

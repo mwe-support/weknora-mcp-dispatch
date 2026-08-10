@@ -7,6 +7,12 @@ recursive-include * *.md
 recursive-include * *.txt
 recursive-include * *.yml
 recursive-include * *.yaml
+prune .pytest_cache
+prune .venv
+prune .artifacts
+prune build
+prune dist
+prune *.egg-info
 global-exclude __pycache__
 global-exclude *.py[co]
 global-exclude .DS_Store

@@ -1503,8 +1503,8 @@ wheels = [
 ]
 
 [[package]]
-name = "tencent-weknora-mcp"
-version = "1.1.1"
+name = "weknora-mcp-dispatch"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },

@@ -12,7 +12,7 @@ def read_readme():
         with open("README.md", "r", encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
-        return "WeKnora MCP Server - Model Context Protocol server for WeKnora API"
+        return "Request-scoped multi-user MCP gateway for WeKnora v0.7.2"
 
 
 # 读取依赖
@@ -32,19 +32,26 @@ def read_requirements():
 
 
 setup(
-    name="tencent-weknora-mcp",
-    version="1.1.1",
+    name="weknora-mcp-dispatch",
+    version="0.2.0",
     author="WeKnora Team",
     author_email="support@weknora.com",
-    description="WeKnora MCP Server - Model Context Protocol server for WeKnora API",
+    maintainer="MWE Support",
+    description="Request-scoped multi-user MCP gateway for WeKnora v0.7.2",
     long_description=read_readme(),
     long_description_content_type="text/markdown",
-    url="https://github.com/Tencent/WeKnora/tree/main/mcp-server",
-    py_modules=["weknora_mcp_server", "upload_paths", "main", "run_server", "run", "test_module"],
+    url="https://github.com/mwe-support/weknora-mcp-dispatch",
+    py_modules=[
+        "weknora_mcp_server",
+        "upload_paths",
+        "main",
+        "run_server",
+        "run",
+        "test_module",
+    ],
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
-        "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.10",

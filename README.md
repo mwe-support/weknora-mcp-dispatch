@@ -1,10 +1,94 @@
-# WeKnora MCP Server
+# WeKnora MCP Dispatch
 
-这是一个 Model Context Protocol (MCP) 服务器，提供对 WeKnora 知识管理 API 的访问。
+这是面向 WeKnora v0.7.2 的多用户 MCP 网关，基于官方 MCP Server 1.1.1
+（MCP Python SDK 2.x 高层 API）改造。一个 Streamable HTTP 服务实例可以接收
+多个客户端请求，并以每个客户端提交的 WeKnora API Key 决定其可访问的空间和知识库。
+
+## 定制能力
+
+- `MCP_AUTH_MODE=weknora_api_key`：将 Bearer Token 作为 WeKnora API Key 验证。
+- API Key 仅绑定到当前 MCP 请求上下文，异步任务和同步工具工作线程均保持租户隔离。
+- 动态 Key 模式不会回退到服务端静态 `WEKNORA_API_KEY`，上下文丢失时失败关闭。
+- 验证缓存只保存 SHA-256 指纹；缓存容量、TTL 和验证并发均有上限。
+- `MCP_READ_ONLY=true`：从 MCP 2.x 工具注册表移除写入、会话和聊天工具。
+- 保留上游 `shared_secret` 和 stdio 模式，便于兼容原有部署。
+
+请求链路：
+
+```text
+MCP client
+  ├─ 可选：外层网关鉴权请求头
+  └─ Authorization: Bearer <WeKnora API Key>
+          ↓
+WeKnora MCP Dispatch
+  ├─ GET /knowledge-bases 验证 Key
+  ├─ 绑定当前请求身份
+  └─ X-API-Key 转发至 WeKnora API
+```
+
+## 生产 Docker 配置
+
+使用本仓库构建镜像，并参考
+[`production.request-scoped.override.yml`](./production.request-scoped.override.yml)
+覆盖 WeKnora 官方 Compose 的 `mcp` 服务。请求级模式下应保持
+`WEKNORA_API_KEY` 和 `MCP_SERVER_AUTH_TOKEN` 为空。
+
+```bash
+docker build -t local/weknora-mcp-dispatch:v0.7.2 .
+```
+
+关键环境变量：
+
+| 变量 | 推荐值 | 说明 |
+| --- | --- | --- |
+| `WEKNORA_BASE_URL` | `http://app:8080/api/v1` | WeKnora API 地址 |
+| `MCP_AUTH_MODE` | `weknora_api_key` | 启用请求级空间 Key |
+| `MCP_READ_ONLY` | `true` | 仅暴露知识查询工具 |
+| `MCP_HTTP_PATH` | `/mcp` | Streamable HTTP 路径 |
+| `MCP_API_KEY_VALIDATION_TTL_SECONDS` | `60` | 验证缓存 TTL |
+| `MCP_API_KEY_VALIDATION_CACHE_MAX_ENTRIES` | `2048` | 最大缓存指纹数 |
+| `MCP_API_KEY_VALIDATION_MAX_CONCURRENCY` | `16` | 最大并发验证数 |
+
+## WorkBuddy 配置示例
+
+写入用户级 `~/.workbuddy/mcp.json` 或项目级 `.workbuddy/mcp.json`：
+
+```json
+{
+  "mcpServers": {
+    "weknora": {
+      "type": "http",
+      "url": "https://kb.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${WEKNORA_SPACE_API_KEY}",
+        "CF-Access-Client-Id": "${CF_ACCESS_CLIENT_ID}",
+        "CF-Access-Client-Secret": "${CF_ACCESS_CLIENT_SECRET}"
+      }
+    }
+  }
+}
+```
+
+如果入口没有 Cloudflare Access，删除两个 `CF-Access-*` 请求头即可。
+
+## Codex 配置示例
+
+在 `~/.codex/config.toml` 中加入：
+
+```toml
+[mcp_servers.weknora]
+url = "https://kb.example.com/mcp"
+bearer_token_env_var = "WEKNORA_SPACE_API_KEY"
+env_http_headers = { "CF-Access-Client-Id" = "CF_ACCESS_CLIENT_ID", "CF-Access-Client-Secret" = "CF_ACCESS_CLIENT_SECRET" }
+```
+
+如果入口没有 Cloudflare Access，删除 `env_http_headers`。不要把 WeKnora API Key
+或外层网关 Secret 明文提交到配置仓库。
 
 ## 快速开始
 
 > 推荐直接参考 [MCP配置说明](./MCP_CONFIG.md)，无需进行以下操作。
+> 本节沿用上游 stdio/静态 Key 用法；多用户 HTTP 生产部署请使用上面的请求级配置。
 
 ### 1. 安装依赖
 ```bash
@@ -69,6 +153,7 @@ uvx --from tencent-weknora-mcp weknora-mcp-server
 > 官方 PyPI 包名为 **`tencent-weknora-mcp`**（Tencent/WeKnora 维护，Trusted Publishing 发布）。
 > 旧社区包 `weknora-mcp` 请不要再使用。
 > 安装后命令行入口仍为 `weknora-mcp-server` / `weknora-server`。
+> 官方 PyPI 包不包含本仓库的请求级多用户派发功能；生产部署该功能时应构建本仓库。
 
 ### 开发模式安装
 ```bash
@@ -102,6 +187,7 @@ python -m build
 运行测试脚本验证模组是否正常工作：
 ```bash
 python test_module.py
+pytest -q tests
 ```
 
 ## 功能特性

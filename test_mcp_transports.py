@@ -93,6 +93,8 @@ class HttpStatelessSmokeTest(unittest.TestCase):
     def test_initialize_does_not_require_mcp_session_id(self):
         import time
 
+        import requests
+
         port = 19876
         env = {
             **os.environ,
@@ -117,43 +119,39 @@ class HttpStatelessSmokeTest(unittest.TestCase):
         )
         try:
             deadline = time.time() + 10
+            response = None
             while time.time() < deadline:
-                probe = subprocess.run(
-                    [
-                        "curl",
-                        "-s",
-                        "-D",
-                        "-",
-                        "-o",
-                        "/dev/null",
-                        "-X",
-                        "POST",
+                try:
+                    response = requests.post(
                         f"http://127.0.0.1:{port}/mcp",
-                        "-H",
-                        "Authorization: Bearer test-token",
-                        "-H",
-                        "Content-Type: application/json",
-                        "-H",
-                        "Accept: application/json, text/event-stream",
-                        "-d",
-                        (
-                            '{"jsonrpc":"2.0","id":1,"method":"initialize",'
-                            '"params":{"protocolVersion":"2025-03-26",'
-                            '"capabilities":{},"clientInfo":{"name":"t","version":"1"}}}'
-                        ),
-                    ],
-                    capture_output=True,
-                    text=True,
-                )
-                if probe.returncode == 0 and "HTTP/" in probe.stdout:
+                        headers={
+                            "Authorization": "Bearer test-token",
+                            "Accept": "application/json, text/event-stream",
+                        },
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "initialize",
+                            "params": {
+                                "protocolVersion": "2025-03-26",
+                                "capabilities": {},
+                                "clientInfo": {"name": "t", "version": "1"},
+                            },
+                        },
+                        timeout=2,
+                    )
                     break
+                except requests.RequestException:
+                    pass
                 time.sleep(0.2)
             else:
                 self.fail("HTTP server did not become ready in time")
 
-            headers = probe.stdout.lower()
-            self.assertIn("200 ok", headers)
-            self.assertNotIn("mcp-session-id:", headers)
+            self.assertIsNotNone(response)
+            self.assertEqual(response.status_code, 200)
+            self.assertNotIn(
+                "mcp-session-id", {name.lower() for name in response.headers}
+            )
         finally:
             proc.terminate()
             try:
