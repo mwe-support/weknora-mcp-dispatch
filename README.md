@@ -4,6 +4,18 @@
 （MCP Python SDK 2.x 高层 API）改造。一个 Streamable HTTP 服务实例可以接收
 多个客户端请求，并以每个客户端提交的 WeKnora API Key 决定其可访问的空间和知识库。
 
+## 上游优先的模块结构
+
+- `weknora_mcp_server.py` 保留官方 v0.7.2 的 MCPServer、30 个工具和
+  `WeKnoraClient` 实现，只包含少量模块接线代码。
+- `weknora_mcp_auth.py` 独立实现请求级 Bearer 鉴权、Key 验证缓存、
+  `ContextVar` 身份隔离、客户端分派和只读工具策略。
+- `tests/test_auth_module.py` 从模块公开接口验证鉴权行为；
+  `tests/test_request_scoped_auth.py` 只验证模块与 MCP SDK 2.x 的集成。
+
+后续同步官方版本时，应先更新官方 MCP 文件，再单独适配鉴权模块接线，避免把
+鉴权实现重新混入官方工具业务代码。
+
 ## 定制能力
 
 - `MCP_AUTH_MODE=weknora_api_key`：将 Bearer Token 作为 WeKnora API Key 验证。
@@ -187,7 +199,14 @@ python -m build
 运行测试脚本验证模组是否正常工作：
 ```bash
 python test_module.py
-pytest -q tests
+pytest test_*.py tests
+```
+
+PowerShell 不展开 `test_*.py` 通配符，可使用：
+
+```powershell
+$rootTests = Get-ChildItem -File -Filter 'test_*.py' | ForEach-Object FullName
+python -m pytest @rootTests tests
 ```
 
 ## 功能特性
@@ -201,6 +220,7 @@ pytest -q tests
 ### 知识库管理
 - `create_knowledge_base` - 创建知识库
 - `list_knowledge_bases` - 列出知识库
+- `list_shared_knowledge_bases` - 列出共享给当前空间的知识库
 - `get_knowledge_base` - 获取知识库详情
 - `delete_knowledge_base` - 删除知识库
 - `hybrid_search` - 混合搜索
@@ -226,10 +246,20 @@ pytest -q tests
 
 ### 聊天功能
 - `chat` - 发送聊天消息
+- `agent_chat` - 使用指定 Agent 发送聊天消息
+
+### Agent 管理
+- `list_agents` - 列出当前空间可用的 Agent
+- `get_agent` - 获取 Agent 详情
 
 ### 块管理
 - `list_chunks` - 列出知识块
 - `delete_chunk` - 删除知识块
+
+### Wiki 查询
+- `wiki_search` - 搜索 Wiki 页面
+- `wiki_read_page` - 读取 Wiki 页面
+- `wiki_index_view` - 查看 Wiki 索引
 
 ## 故障排除
 

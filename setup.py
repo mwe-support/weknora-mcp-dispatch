@@ -43,6 +43,7 @@ setup(
     url="https://github.com/mwe-support/weknora-mcp-dispatch",
     py_modules=[
         "weknora_mcp_server",
+        "weknora_mcp_auth",
         "upload_paths",
         "main",
         "run_server",

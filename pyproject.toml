@@ -61,7 +61,7 @@ weknora-mcp-server = "main:sync_main"
 weknora-server = "run_server:main"
 
 [tool.setuptools]
-py-modules = ["weknora_mcp_server", "upload_paths", "main", "run_server", "run", "test_module"]
+py-modules = ["weknora_mcp_server", "weknora_mcp_auth", "upload_paths", "main", "run_server", "run", "test_module"]
 include-package-data = true
 
 [tool.setuptools.package-data]
