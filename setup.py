@@ -12,7 +12,7 @@ def read_readme():
         with open("README.md", "r", encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
-        return "Request-scoped multi-user MCP gateway for WeKnora"
+        return "WeKnora MCP Server - Model Context Protocol server for WeKnora API"
 
 
 # 读取依赖
@@ -23,27 +23,24 @@ def read_requirements():
                 line.strip() for line in f if line.strip() and not line.startswith("#")
             ]
     except FileNotFoundError:
-        return ["mcp>=1.0.0", "requests>=2.31.0"]
+        return [
+            "mcp>=2,<3",
+            "requests>=2.31.0",
+            "starlette>=0.27.0",
+            "uvicorn>=0.24.0",
+        ]
 
 
 setup(
-    name="weknora-mcp-dispatch",
-    version="0.1.0",
+    name="tencent-weknora-mcp",
+    version="1.1.1",
     author="WeKnora Team",
     author_email="support@weknora.com",
-    maintainer="MWE Support",
-    description="Request-scoped multi-user MCP gateway for WeKnora",
+    description="WeKnora MCP Server - Model Context Protocol server for WeKnora API",
     long_description=read_readme(),
     long_description_content_type="text/markdown",
-    url="https://github.com/mwe-support/weknora-mcp-dispatch",
-    py_modules=[
-        "weknora_mcp_server",
-        "upload_paths",
-        "main",
-        "run_server",
-        "run",
-        "test_module",
-    ],
+    url="https://github.com/Tencent/WeKnora/tree/main/mcp-server",
+    py_modules=["weknora_mcp_server", "upload_paths", "main", "run_server", "run", "test_module"],
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",

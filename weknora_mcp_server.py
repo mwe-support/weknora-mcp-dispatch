@@ -7,24 +7,19 @@ A Model Context Protocol server that provides access to the WeKnora knowledge ma
 
 import argparse
 import asyncio
-import contextvars
 import functools
-import hashlib
 import json
 import logging
 import os
 import re
 import secrets
 import sys
-import time
-from typing import Any, Awaitable, Callable, Dict
+import threading
+from typing import Any, Dict
 
 import urllib3
-import mcp.server.stdio
-import mcp.types as types
 import requests
-from mcp.server import NotificationOptions, Server
-from mcp.server.models import InitializationOptions
+from mcp.server import MCPServer
 from requests.exceptions import RequestException
 from upload_paths import resolve_upload_file_path, set_active_transport
 
@@ -35,62 +30,6 @@ logger = logging.getLogger(__name__)
 # Configuration - Load from environment variables with defaults
 WEKNORA_BASE_URL = os.getenv("WEKNORA_BASE_URL", "http://localhost:8080/api/v1")
 WEKNORA_API_KEY = os.getenv("WEKNORA_API_KEY", "")
-MCP_READ_ONLY = os.getenv("MCP_READ_ONLY", "false").lower() == "true"
-AUTH_MODE_SHARED_SECRET = "shared_secret"
-AUTH_MODE_WEKNORA_API_KEY = "weknora_api_key"
-
-
-def _normalize_path_prefix(path_prefix: str) -> str:
-    path_prefix = (path_prefix or "/").strip()
-    if not path_prefix.startswith("/"):
-        path_prefix = f"/{path_prefix}"
-    return path_prefix.rstrip("/") or "/"
-
-
-MCP_AUTH_MODE = os.getenv("MCP_AUTH_MODE", AUTH_MODE_SHARED_SECRET).strip().lower()
-MCP_HTTP_PATH = _normalize_path_prefix(os.getenv("MCP_HTTP_PATH", "/"))
-try:
-    MCP_API_KEY_VALIDATION_TTL_SECONDS = max(
-        1, int(os.getenv("MCP_API_KEY_VALIDATION_TTL_SECONDS", "60"))
-    )
-except ValueError:
-    logger.warning(
-        "MCP_API_KEY_VALIDATION_TTL_SECONDS is invalid; falling back to 60s."
-    )
-    MCP_API_KEY_VALIDATION_TTL_SECONDS = 60
-try:
-    MCP_API_KEY_VALIDATION_CACHE_MAX_ENTRIES = max(
-        16, int(os.getenv("MCP_API_KEY_VALIDATION_CACHE_MAX_ENTRIES", "2048"))
-    )
-except ValueError:
-    logger.warning(
-        "MCP_API_KEY_VALIDATION_CACHE_MAX_ENTRIES is invalid; falling back to 2048."
-    )
-    MCP_API_KEY_VALIDATION_CACHE_MAX_ENTRIES = 2048
-try:
-    MCP_API_KEY_VALIDATION_MAX_CONCURRENCY = max(
-        1, int(os.getenv("MCP_API_KEY_VALIDATION_MAX_CONCURRENCY", "16"))
-    )
-except ValueError:
-    logger.warning(
-        "MCP_API_KEY_VALIDATION_MAX_CONCURRENCY is invalid; falling back to 16."
-    )
-    MCP_API_KEY_VALIDATION_MAX_CONCURRENCY = 16
-READ_ONLY_TOOL_NAMES = frozenset(
-    {
-        "list_knowledge_bases",
-        "get_knowledge_base",
-        "hybrid_search",
-        "list_knowledge",
-        "get_knowledge",
-        "list_chunks",
-        "list_agents",
-        "get_agent",
-        "wiki_search",
-        "wiki_read_page",
-        "wiki_index_view",
-    }
-)
 # Chat SSE read timeout in seconds. LLM responses can be slow; default 300s.
 try:
     WEKNORA_CHAT_TIMEOUT = int(os.getenv("WEKNORA_CHAT_TIMEOUT", "300"))
@@ -98,35 +37,18 @@ except ValueError:
     logger.warning("WEKNORA_CHAT_TIMEOUT is not a valid integer; falling back to 300s.")
     WEKNORA_CHAT_TIMEOUT = 300
 
+# Network transport defaults kept for backward compatibility with pre-2.x deployments.
+SSE_MESSAGE_PATH = "/sse/messages/"
+STREAMABLE_HTTP_STATELESS = True
+
 
 def network_transport_auth_token() -> str:
     """Shared secret clients must present for SSE/HTTP transports."""
     return os.getenv("MCP_SERVER_AUTH_TOKEN", "").strip()
 
 
-def network_transport_auth_mode() -> str:
-    """Return the configured network authentication mode."""
-    return os.getenv("MCP_AUTH_MODE", MCP_AUTH_MODE).strip().lower()
-
-
 def require_network_transport_auth(transport: str) -> str:
-    """Validate network authentication configuration and return a legacy token."""
-    auth_mode = network_transport_auth_mode()
-    if auth_mode not in {AUTH_MODE_SHARED_SECRET, AUTH_MODE_WEKNORA_API_KEY}:
-        logger.error(
-            "Unsupported MCP_AUTH_MODE=%r; use shared_secret or weknora_api_key.",
-            auth_mode,
-        )
-        sys.exit(1)
-    if auth_mode == AUTH_MODE_WEKNORA_API_KEY:
-        if transport == "sse":
-            logger.error(
-                "MCP_AUTH_MODE=weknora_api_key is only supported by the stateless "
-                "Streamable HTTP transport."
-            )
-            sys.exit(1)
-        return ""
-
+    """SSE/HTTP must not start without a configured auth token."""
     token = network_transport_auth_token()
     if transport in ("sse", "http") and not token:
         logger.error(
@@ -139,138 +61,12 @@ def require_network_transport_auth(transport: str) -> str:
     return token
 
 
-_REQUEST_API_KEY: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "weknora_request_api_key", default=""
-)
-_API_KEY_VALIDATION_CACHE: dict[str, tuple[float, bool]] = {}
-_API_KEY_VALIDATION_SEMAPHORE = asyncio.Semaphore(
-    MCP_API_KEY_VALIDATION_MAX_CONCURRENCY
-)
-
-
-def current_request_api_key() -> str:
-    """Return the WeKnora API key bound to the current request task."""
-    return _REQUEST_API_KEY.get()
-
-
-def bind_request_api_key(api_key: str):
-    """Bind an API key to the current async context and return its reset token."""
-    return _REQUEST_API_KEY.set(api_key)
-
-
-def reset_request_api_key(token) -> None:
-    """Restore the previous request API key context."""
-    _REQUEST_API_KEY.reset(token)
-
-
-def _api_key_fingerprint(api_key: str) -> str:
-    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
-
-
-def _cache_api_key_validation_result(
-    fingerprint: str, expires_at: float, valid: bool
-) -> None:
-    """Insert a bounded cache entry without retaining raw credentials."""
-    now = time.monotonic()
-    if len(_API_KEY_VALIDATION_CACHE) >= MCP_API_KEY_VALIDATION_CACHE_MAX_ENTRIES:
-        expired = [
-            key for key, (expiry, _) in _API_KEY_VALIDATION_CACHE.items() if expiry <= now
-        ]
-        for key in expired:
-            _API_KEY_VALIDATION_CACHE.pop(key, None)
-    while len(_API_KEY_VALIDATION_CACHE) >= MCP_API_KEY_VALIDATION_CACHE_MAX_ENTRIES:
-        _API_KEY_VALIDATION_CACHE.pop(next(iter(_API_KEY_VALIDATION_CACHE)))
-    _API_KEY_VALIDATION_CACHE[fingerprint] = (expires_at, valid)
-
-
-def _validate_weknora_api_key_sync(api_key: str) -> bool | None:
-    """Validate a key with a safe, read-only WeKnora request.
-
-    ``None`` means the upstream service was unavailable and should result in a
-    temporary 503 rather than incorrectly labelling the credential invalid.
-    Raw API keys are never logged or used as cache keys.
-    """
-    fingerprint = _api_key_fingerprint(api_key)
-    now = time.monotonic()
-    cached = _API_KEY_VALIDATION_CACHE.get(fingerprint)
-    if cached and cached[0] > now:
-        return cached[1]
-
-    try:
-        response = requests.get(
-            f"{WEKNORA_BASE_URL}/knowledge-bases",
-            headers={"X-API-Key": api_key, "Accept": "application/json"},
-            timeout=(3, 10),
-            verify=os.getenv("WEKNORA_VERIFY_SSL", "true").lower() != "false",
-        )
-    except RequestException as exc:
-        logger.error("WeKnora API key validation is temporarily unavailable: %s", exc)
-        return None
-
-    if 200 <= response.status_code < 300:
-        valid = True
-    elif response.status_code in {408, 425, 429}:
-        logger.warning(
-            "WeKnora API key validation was temporarily limited with status %d",
-            response.status_code,
-        )
-        return None
-    elif 400 <= response.status_code < 500:
-        valid = False
-    else:
-        logger.error(
-            "WeKnora API key validation returned upstream status %d",
-            response.status_code,
-        )
-        return None
-
-    ttl = MCP_API_KEY_VALIDATION_TTL_SECONDS if valid else min(10, MCP_API_KEY_VALIDATION_TTL_SECONDS)
-    _cache_api_key_validation_result(fingerprint, now + ttl, valid)
-    return valid
-
-
-async def validate_weknora_api_key(api_key: str) -> bool | None:
-    """Asynchronously validate a WeKnora API key without blocking the event loop."""
-    try:
-        await asyncio.wait_for(_API_KEY_VALIDATION_SEMAPHORE.acquire(), timeout=1.0)
-    except TimeoutError:
-        logger.warning("WeKnora API key validation concurrency limit reached")
-        return None
-    try:
-        return await asyncio.to_thread(_validate_weknora_api_key_sync, api_key)
-    finally:
-        _API_KEY_VALIDATION_SEMAPHORE.release()
-
-
 class MCPAuthMiddleware:
-    """Authenticate MCP requests using a shared secret or a WeKnora API key."""
+    """ASGI middleware that gates network MCP transports behind a shared secret."""
 
-    def __init__(
-        self,
-        app,
-        token: str,
-        auth_mode: str = "shared_secret",
-        api_key_validator: Callable[[str], Awaitable[bool | None]] | None = None,
-    ):
+    def __init__(self, app, token: str):
         self.app = app
         self.token = token
-        self.auth_mode = auth_mode
-        self.api_key_validator = api_key_validator or validate_weknora_api_key
-
-    @staticmethod
-    async def _send_error(send, status: int, error: str) -> None:
-        body = json.dumps({"error": error}, separators=(",", ":")).encode("utf-8")
-        await send(
-            {
-                "type": "http.response.start",
-                "status": status,
-                "headers": [
-                    [b"content-type", b"application/json"],
-                    [b"www-authenticate", b"Bearer"],
-                ],
-            }
-        )
-        await send({"type": "http.response.body", "body": body})
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http":
@@ -285,62 +81,46 @@ class MCPAuthMiddleware:
         auth = headers.get("authorization", "")
         if auth.lower().startswith("bearer "):
             provided = auth[7:].strip()
-        elif self.auth_mode == AUTH_MODE_SHARED_SECRET and "x-mcp-auth-token" in headers:
+        elif "x-mcp-auth-token" in headers:
             provided = headers["x-mcp-auth-token"]
 
-        if not provided:
-            await self._send_error(send, 401, "missing_api_key")
+        if not provided or not secrets.compare_digest(provided, self.token):
+            body = b'{"error":"unauthorized"}'
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [[b"content-type", b"application/json"]],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
             return
 
-        if self.auth_mode == AUTH_MODE_SHARED_SECRET:
-            if not self.token or not secrets.compare_digest(provided, self.token):
-                await self._send_error(send, 401, "unauthorized")
-                return
-            await self.app(scope, receive, send)
-            return
-
-        if self.auth_mode != AUTH_MODE_WEKNORA_API_KEY:
-            await self._send_error(send, 500, "invalid_server_auth_mode")
-            return
-
-        validation = await self.api_key_validator(provided)
-        if validation is None:
-            await self._send_error(send, 503, "authentication_service_unavailable")
-            return
-        if not validation:
-            await self._send_error(send, 403, "invalid_or_unscoped_api_key")
-            return
-
-        context_token = bind_request_api_key(provided)
-        try:
-            await self.app(scope, receive, send)
-        finally:
-            reset_request_api_key(context_token)
+        await self.app(scope, receive, send)
 
 
-class MCPPathPrefixMiddleware:
-    """Expose the root-mounted MCP app under one configurable public path."""
+def _normalize_kb_entries(resp: object) -> list[Dict]:
+    """Flatten owned and shared knowledge-base list API responses.
 
-    def __init__(self, app, path_prefix: str):
-        self.app = app
-        self.path_prefix = _normalize_path_prefix(path_prefix)
+    GET /knowledge-bases returns ``data: [{id, name, ...}, ...]`` (see
+    KnowledgeBaseHandler.buildKBListResponse).
 
-    async def __call__(self, scope, receive, send):
-        if scope.get("type") != "http" or self.path_prefix == "/":
-            await self.app(scope, receive, send)
-            return
-
-        path = scope.get("path", "")
-        if path not in {self.path_prefix, f"{self.path_prefix}/"}:
-            await MCPAuthMiddleware._send_error(send, 404, "not_found")
-            return
-
-        inner_path = path[len(self.path_prefix) :] or "/"
-        inner_scope = dict(scope)
-        inner_scope["path"] = inner_path
-        inner_scope["raw_path"] = inner_path.encode("utf-8")
-        inner_scope["root_path"] = f"{scope.get('root_path', '')}{self.path_prefix}"
-        await self.app(inner_scope, receive, send)
+    GET /shared-knowledge-bases returns ``data: [{knowledge_base: {id, name,
+    ...}, share_id, ...}, ...]`` (see organization handler sharedKBRow).
+    """
+    data = resp.get("data", resp) if isinstance(resp, dict) else resp
+    if isinstance(data, dict):
+        data = data.get("list", data.get("items", []))
+    out: list[Dict] = []
+    for item in (data or []):
+        if not isinstance(item, dict):
+            continue
+        nested = item.get("knowledge_base")
+        if isinstance(nested, dict) and nested.get("id"):
+            out.append(nested)
+        elif item.get("id"):
+            out.append(item)
+    return out
 
 
 class WeKnoraClient:
@@ -359,20 +139,26 @@ class WeKnoraClient:
                 "This is insecure and should not be used in production."
             )
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        # Create a persistent session for connection pooling and performance
-        self.session = requests.Session()
-        self.session.verify = self.verify_ssl
-        # Set default headers for all requests
-        self.session.headers.update(
+        # MCP 2.x runs sync @mcp.tool() handlers on worker threads; use a
+        # thread-local Session because requests.Session is not thread-safe.
+        self._session_local = threading.local()
+
+    def _new_session(self) -> requests.Session:
+        session = requests.Session()
+        session.verify = self.verify_ssl
+        session.headers.update(
             {
-                "X-API-Key": api_key,  # API key for authentication
-                "Content-Type": "application/json",  # Default content type
+                "X-API-Key": self.api_key,
+                "Content-Type": "application/json",
             }
         )
+        return session
 
-    def close(self) -> None:
-        """Close the per-request HTTP session."""
-        self.session.close()
+    @property
+    def session(self) -> requests.Session:
+        if not getattr(self._session_local, "session", None):
+            self._session_local.session = self._new_session()
+        return self._session_local.session
 
     def _request(self, method: str, endpoint: str, **kwargs) -> Dict[str, Any]:
         """Make a request to the WeKnora API
@@ -432,6 +218,10 @@ class WeKnoraClient:
         """List all knowledge bases"""
         return self._request("GET", "/knowledge-bases")
 
+    def list_shared_knowledge_bases(self) -> Dict:
+        """List knowledge bases shared from other workspaces"""
+        return self._request("GET", "/shared-knowledge-bases")
+
     def get_knowledge_base(self, kb_id: str) -> Dict:
         """Get knowledge base details"""
         return self._request("GET", f"/knowledge-bases/{kb_id}")
@@ -451,11 +241,12 @@ class WeKnoraClient:
     )
 
     def resolve_agent_id(self, agent_id_or_name: str) -> str:
-        """Resolve an agent name to its UUID if needed.
+        """Resolve an agent ID or name to its canonical ID.
 
         If *agent_id_or_name* is already a UUID it is returned unchanged.
-        Otherwise all agents are listed and the first one whose
-        ``name`` matches (case-insensitive) is returned.
+        Otherwise all agents are listed and the first one whose ``id``
+        matches exactly or whose ``name`` matches case-insensitively is
+        returned.
         Raises ValueError when no match is found.
         """
         if self._UUID_RE.match(agent_id_or_name):
@@ -466,7 +257,11 @@ class WeKnoraClient:
             agents = agents.get("list", agents.get("items", []))
         needle = agent_id_or_name.lower()
         for agent in (agents or []):
-            if isinstance(agent, dict) and agent.get("name", "").lower() == needle:
+            if not isinstance(agent, dict):
+                continue
+            if agent.get("id") == agent_id_or_name:
+                return agent["id"]
+            if agent.get("name", "").lower() == needle:
                 return agent["id"]
         raise ValueError(
             f"Agent {agent_id_or_name!r} not found. "
@@ -483,17 +278,15 @@ class WeKnoraClient:
         """
         if self._UUID_RE.match(kb_id_or_name):
             return kb_id_or_name
-        resp = self.list_knowledge_bases()
-        kbs = resp.get("data", resp) if isinstance(resp, dict) else resp
-        if isinstance(kbs, dict):
-            kbs = kbs.get("list", kbs.get("items", []))
+        # Search own + shared knowledge bases for a name match
         needle = kb_id_or_name.lower()
-        for kb in (kbs or []):
-            if isinstance(kb, dict) and kb.get("name", "").lower() == needle:
-                return kb["id"]
+        for source in (self.list_knowledge_bases, self.list_shared_knowledge_bases):
+            for kb in _normalize_kb_entries(source()):
+                if kb.get("name", "").lower() == needle:
+                    return kb["id"]
         raise ValueError(
             f"Knowledge base {kb_id_or_name!r} not found. "
-            "Use list_knowledge_bases to see available IDs and names."
+            "Use list_knowledge_bases or list_shared_knowledge_bases to see available IDs and names."
         )
 
     def hybrid_search(self, kb_id: str, query: str, config: Dict) -> Dict:
@@ -525,6 +318,7 @@ class WeKnoraClient:
                 headers=headers,
                 files=files,
                 data=data,
+                verify=self.verify_ssl,
             )
             response.raise_for_status()
             return response.json()
@@ -539,6 +333,31 @@ class WeKnoraClient:
         }
         return self._request(
             "POST", f"/knowledge-bases/{kb_id}/knowledge/url", json=data
+        )
+
+    def create_knowledge_from_text(
+        self,
+        kb_id: str,
+        title: str,
+        content: str,
+        tag_ids: list[str] | None = None,
+        status: str = "publish",
+    ) -> Dict:
+        """Create a knowledge entry from raw Markdown text (manual knowledge).
+
+        ``status`` defaults to ``"publish"`` so the entry is chunked, embedded
+        and made searchable immediately, which suits API/MCP callers that have
+        no UI to publish drafts. Pass ``"draft"`` to save without indexing.
+        """
+        data = {
+            "title": title,
+            "content": content,
+            "status": status,
+        }
+        if tag_ids:
+            data["tag_ids"] = tag_ids
+        return self._request(
+            "POST", f"/knowledge-bases/{kb_id}/knowledge/manual", json=data
         )
 
     def list_knowledge(self, kb_id: str, page: int = 1, page_size: int = 20) -> Dict:
@@ -636,12 +455,12 @@ class WeKnoraClient:
 
         Centralised helper used by both chat() and agent_chat().
         Timeout: (10s connect, WEKNORA_CHAT_TIMEOUT read) — configurable via env var.
-
+        
         Server-Sent Events (SSE) stream format:
           data: {"response_type": "answer", "content": "..."}
           data: {"response_type": "references", "knowledge_references": [...]}
           data: {"response_type": "complete"}
-
+        
         We accumulate answer chunks and extract references, returning them as a dict.
         """
         try:
@@ -790,901 +609,462 @@ class WeKnoraClient:
         )
 
 
-# Initialize MCP server instance
-app = Server("weknora-server")
+# Initialize MCP server instance (mcp 2.x high-level API).
+# MCPServer (formerly FastMCP) builds input schemas from function type hints
+# and serializes plain return values automatically.
+mcp = MCPServer("weknora-server", version="1.1.1")
+# Initialize WeKnora API client with configuration
+client = WeKnoraClient(WEKNORA_BASE_URL, WEKNORA_API_KEY)
 
 
-def weknora_client_for_request() -> WeKnoraClient:
-    """Create an upstream client using only the active request credential.
-
-    Dynamic HTTP mode deliberately has no environment-key fallback: if context
-    propagation ever fails, the request fails closed instead of crossing tenant
-    boundaries. Stdio and legacy shared-secret modes retain the existing env key.
-    """
-    api_key = current_request_api_key()
-    if not api_key and network_transport_auth_mode() != AUTH_MODE_WEKNORA_API_KEY:
-        api_key = WEKNORA_API_KEY
-    if not api_key:
-        raise PermissionError("No request-scoped WeKnora API key is available")
-    return WeKnoraClient(WEKNORA_BASE_URL, api_key)
+# ---------------------------------------------------------------------------
+# Tool registrations
+#
+# Each tool is a plain function decorated with @mcp.tool(). Parameters are
+# declared via type hints (the framework derives the JSON Schema); required
+# parameters have no default. Descriptions come from the docstring. Tools
+# return dicts/str and the framework handles serialization and error wrapping.
+# Blocking network I/O (chat / agent_chat) is offloaded to a thread executor
+# so the async event loop is not blocked.
+# ---------------------------------------------------------------------------
 
 
-# Tool definitions - Register all available tools for the MCP protocol
-@app.list_tools()
-async def handle_list_tools() -> list[types.Tool]:
-    """List all available WeKnora tools with their schemas"""
-    available_tools = [
-        # Tenant Management
-        types.Tool(
-            name="create_tenant",
-            description="Create a new tenant in WeKnora",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Tenant name"},
-                    "description": {
-                        "type": "string",
-                        "description": "Tenant description",
-                    },
-                    "business": {"type": "string", "description": "Business type"},
-                    "retriever_engines": {
-                        "type": "object",
-                        "description": "Retriever engine configuration",
-                        "properties": {
-                            "engines": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "retriever_type": {"type": "string"},
-                                        "retriever_engine_type": {"type": "string"},
-                                    },
-                                },
-                            }
-                        },
-                    },
-                },
-                "required": ["name", "description", "business"],
-            },
-        ),
-        types.Tool(
-            name="list_tenants",
-            description="List all tenants",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        # Knowledge Base Management
-        types.Tool(
-            name="create_knowledge_base",
-            description="Create a new knowledge base",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Knowledge base name"},
-                    "description": {
-                        "type": "string",
-                        "description": "Knowledge base description",
-                    },
-                    "embedding_model_id": {
-                        "type": "string",
-                        "description": "Embedding model ID",
-                    },
-                    "summary_model_id": {
-                        "type": "string",
-                        "description": "Summary model ID",
-                    },
-                },
-                "required": ["name", "description"],
-            },
-        ),
-        types.Tool(
-            name="list_knowledge_bases",
-            description="List all knowledge bases",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        types.Tool(
-            name="get_knowledge_base",
-            description="Get knowledge base details",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "kb_id": {"type": "string", "description": "Knowledge base ID"}
-                },
-                "required": ["kb_id"],
-            },
-        ),
-        types.Tool(
-            name="delete_knowledge_base",
-            description="Delete a knowledge base",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "kb_id": {"type": "string", "description": "Knowledge base ID"}
-                },
-                "required": ["kb_id"],
-            },
-        ),
-        types.Tool(
-            name="hybrid_search",
-            description="Perform hybrid search in knowledge base",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "kb_id": {
-                        "type": "string",
-                        "description": "Knowledge base UUID (e.g. 'a1b2c3d4-e5f6-7890-abcd-ef1234567890') OR name (e.g. 'my-knowledge-base'). Use list_knowledge_bases to discover available knowledge bases.",
-                    },
-                    "query": {"type": "string", "description": "Search query"},
-                    "vector_threshold": {
-                        "type": "number",
-                        "description": "Vector similarity threshold",
-                        "default": 0.5,
-                    },
-                    "keyword_threshold": {
-                        "type": "number",
-                        "description": "Keyword match threshold",
-                        "default": 0.3,
-                    },
-                    "match_count": {
-                        "type": "integer",
-                        "description": "Number of results to return",
-                        "default": 5,
-                    },
-                },
-                "required": ["kb_id", "query"],
-            },
-        ),
-        # Knowledge Management
-        types.Tool(
-            name="create_knowledge_from_file",
-            description="Create knowledge from a local file on the server filesystem",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "kb_id": {"type": "string", "description": "Knowledge base ID"},
-                    "file_path": {
-                        "type": "string",
-                        "description": "Absolute path to the local file on the server",
-                    },
-                    "enable_multimodel": {
-                        "type": "boolean",
-                        "description": "Enable multimodal processing",
-                        "default": True,
-                    },
-                },
-                "required": ["kb_id", "file_path"],
-            },
-        ),
-        types.Tool(
-            name="create_knowledge_from_url",
-            description="Create knowledge from URL",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "kb_id": {"type": "string", "description": "Knowledge base ID"},
-                    "url": {
-                        "type": "string",
-                        "description": "URL to create knowledge from",
-                    },
-                    "enable_multimodel": {
-                        "type": "boolean",
-                        "description": "Enable multimodal processing",
-                        "default": True,
-                    },
-                },
-                "required": ["kb_id", "url"],
-            },
-        ),
-        types.Tool(
-            name="list_knowledge",
-            description="List knowledge in a knowledge base",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "kb_id": {"type": "string", "description": "Knowledge base ID"},
-                    "page": {
-                        "type": "integer",
-                        "description": "Page number",
-                        "default": 1,
-                    },
-                    "page_size": {
-                        "type": "integer",
-                        "description": "Page size",
-                        "default": 20,
-                    },
-                },
-                "required": ["kb_id"],
-            },
-        ),
-        types.Tool(
-            name="get_knowledge",
-            description="Get knowledge details",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "knowledge_id": {"type": "string", "description": "Knowledge ID"}
-                },
-                "required": ["knowledge_id"],
-            },
-        ),
-        types.Tool(
-            name="delete_knowledge",
-            description="Delete knowledge",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "knowledge_id": {"type": "string", "description": "Knowledge ID"}
-                },
-                "required": ["knowledge_id"],
-            },
-        ),
-        # Model Management
-        types.Tool(
-            name="create_model",
-            description="Create a new model",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Model name"},
-                    "type": {
-                        "type": "string",
-                        "description": "Model type (KnowledgeQA, Embedding, Rerank)",
-                    },
-                    "source": {
-                        "type": "string",
-                        "description": "Model source",
-                        "default": "local",
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Model description",
-                    },
-                    "base_url": {
-                        "type": "string",
-                        "description": "Model API base URL",
-                        "default": "",
-                    },
-                    "api_key": {
-                        "type": "string",
-                        "description": "Model API key",
-                        "default": "",
-                    },
-                    "is_default": {
-                        "type": "boolean",
-                        "description": "Set as default model",
-                        "default": False,
-                    },
-                },
-                "required": ["name", "type", "description"],
-            },
-        ),
-        types.Tool(
-            name="list_models",
-            description="List all models",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        types.Tool(
-            name="get_model",
-            description="Get model details",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "model_id": {"type": "string", "description": "Model ID"}
-                },
-                "required": ["model_id"],
-            },
-        ),
-        # Session Management
-        types.Tool(
-            name="create_session",
-            description="Create a new chat session with conversation strategy for a knowledge base",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "kb_id": {"type": "string", "description": "Knowledge base ID"},
-                    "max_rounds": {
-                        "type": "integer",
-                        "description": "Maximum conversation rounds",
-                        "default": 5,
-                    },
-                    "enable_rewrite": {
-                        "type": "boolean",
-                        "description": "Enable query rewriting",
-                        "default": True,
-                    },
-                    "fallback_response": {
-                        "type": "string",
-                        "description": "Fallback response when no answer found",
-                        "default": "Sorry, I cannot answer this question.",
-                    },
-                    "summary_model_id": {"type": "string", "description": "Model ID for response summarization (optional)"},
-                    "title": {"type": "string", "description": "Session title (optional)"},
-                    "description": {"type": "string", "description": "Session description (optional)"},
-                },
-                "required": ["kb_id"],
-            },
-        ),
-        types.Tool(
-            name="get_session",
-            description="Get session details",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "session_id": {"type": "string", "description": "Session ID"}
-                },
-                "required": ["session_id"],
-            },
-        ),
-        types.Tool(
-            name="list_sessions",
-            description="List chat sessions",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "page": {
-                        "type": "integer",
-                        "description": "Page number",
-                        "default": 1,
-                    },
-                    "page_size": {
-                        "type": "integer",
-                        "description": "Page size",
-                        "default": 20,
-                    },
-                },
-            },
-        ),
-        types.Tool(
-            name="delete_session",
-            description="Delete a session",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "session_id": {"type": "string", "description": "Session ID"}
-                },
-                "required": ["session_id"],
-            },
-        ),
-        # Chat Functionality
-        types.Tool(
-            name="chat",
-            description=(
-                "RAG pipeline chat: retrieve relevant chunks from knowledge bases, then summarise with LLM. "
-                "ALWAYS provide knowledge_base_ids (names like 'my-knowledge-base' or UUIDs) so retrieval can run — "
-                "without them the answer is based on LLM knowledge only. "
-                "Use list_knowledge_bases to discover available knowledge bases. "
-                "For multi-step reasoning or tool-calling use agent_chat instead."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "session_id": {"type": "string", "description": "Session ID (from create_session or list_sessions)"},
-                    "query": {"type": "string", "description": "User query"},
-                    "knowledge_base_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Knowledge base names OR UUIDs to search. Strongly recommended for RAG — without them the answer falls back to LLM knowledge only. E.g. ['my-knowledge-base'] or ['a1b2c3d4-...']. Use list_knowledge_bases to find them.",
-                    },
-                    "web_search_enabled": {"type": "boolean", "description": "Enable web search alongside KB retrieval.", "default": False},
-                },
-                "required": ["session_id", "query"],
-            },
-        ),
-        types.Tool(
-            name="agent_chat",
-            description=(
-                "Agentic pipeline chat: the agent autonomously calls tools (knowledge_search, web_search, SQL, etc.) "
-                "to answer the query. Use this for complex multi-step questions or comparative analysis. "
-                "REQUIRED: agent_id (name or UUID) — use list_agents to discover agents. "
-                "IMPORTANT: many agents have KBSelectionMode=none and NO built-in knowledge bases. "
-                "In that case you MUST pass knowledge_base_ids, otherwise the agent will fail with "
-                "'no search targets available'. "
-                "Use get_agent to inspect an agent's kb_selection_mode and knowledge_bases before calling. "
-                "If kb_selection_mode is 'none' or 'selected' with an empty list, always provide knowledge_base_ids."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "session_id": {"type": "string", "description": "Session ID (from create_session or list_sessions)"},
-                    "query": {"type": "string", "description": "User query"},
-                    "agent_id": {
-                        "type": "string",
-                        "description": "REQUIRED. Custom agent UUID or name. Use list_agents to discover agents. Use get_agent to check its kb_selection_mode.",
-                    },
-                    "knowledge_base_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Names or UUIDs of knowledge bases to search. REQUIRED when the agent's kb_selection_mode is 'none' or 'selected' with no built-in KBs. Use list_knowledge_bases to find them.",
-                    },
-                    "web_search_enabled": {"type": "boolean", "description": "Enable web search.", "default": False},
-                },
-                "required": ["session_id", "query", "agent_id"],
-            },
-        ),
-        types.Tool(
-            name="list_agents",
-            description="List all custom agents available to the current tenant. Use this to discover agent IDs, names, and their KB selection mode before calling agent_chat.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "page": {"type": "integer", "description": "Page number", "default": 1},
-                    "page_size": {"type": "integer", "description": "Page size", "default": 50},
-                },
-                "required": [],
-            },
-        ),
-        types.Tool(
-            name="get_agent",
-            description=(
-                "Get full configuration of a single agent by UUID or name. "
-                "Check kb_selection_mode and knowledge_bases fields: "
-                "if kb_selection_mode is 'none' or 'selected' with an empty knowledge_bases list, "
-                "you MUST pass knowledge_base_ids when calling agent_chat."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "agent_id": {"type": "string", "description": "Agent UUID or name"},
-                },
-                "required": ["agent_id"],
-            },
-        ),
-        # Chunk Management
-        types.Tool(
-            name="list_chunks",
-            description="List chunks of knowledge",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "knowledge_id": {"type": "string", "description": "Knowledge ID"},
-                    "page": {
-                        "type": "integer",
-                        "description": "Page number",
-                        "default": 1,
-                    },
-                    "page_size": {
-                        "type": "integer",
-                        "description": "Page size",
-                        "default": 20,
-                    },
-                },
-                "required": ["knowledge_id"],
-            },
-        ),
-        types.Tool(
-            name="delete_chunk",
-            description="Delete a chunk",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "knowledge_id": {"type": "string", "description": "Knowledge ID"},
-                    "chunk_id": {"type": "string", "description": "Chunk ID"},
-                },
-                "required": ["knowledge_id", "chunk_id"],
-            },
-        ),
-        # Wiki Read-Only - Tools for querying LLM-generated wiki pages
-        types.Tool(
-            name="wiki_search",
-            description="Search wiki pages by full-text query. Returns matching wiki pages with title, slug, summary, and content snippets.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "kb_id": {"type": "string", "description": "Knowledge base ID"},
-                    "query": {"type": "string", "description": "Search query text"},
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results to return",
-                        "default": 10,
-                    },
-                },
-                "required": ["kb_id", "query"],
-            },
-        ),
-        types.Tool(
-            name="wiki_read_page",
-            description="Read a wiki page by its slug. Returns full markdown content, metadata, inbound/outbound links, and source references.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "kb_id": {"type": "string", "description": "Knowledge base ID"},
-                    "slug": {
-                        "type": "string",
-                        "description": "Page slug (e.g. 'entity/acme-corp', 'concept/rag')",
-                    },
-                },
-                "required": ["kb_id", "slug"],
-            },
-        ),
-        types.Tool(
-            name="wiki_index_view",
-            description="Get a structured wiki index with per-type directory groups. Returns an overview of all wiki pages organized by type (entity, concept, summary, etc.).",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "kb_id": {"type": "string", "description": "Knowledge base ID"},
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum items per type group",
-                        "default": 50,
-                    },
-                },
-                "required": ["kb_id"],
-            },
-        ),
-    ]
-    if MCP_READ_ONLY:
-        return [tool for tool in available_tools if tool.name in READ_ONLY_TOOL_NAMES]
-    return available_tools
-
-
-@app.call_tool()
-async def handle_call_tool(
-    name: str, arguments: dict | None
-) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-    """Handle tool execution requests from MCP clients
-
-    Args:
-        name: Name of the tool to execute
-        arguments: Tool arguments as dictionary
-
-    Returns:
-        List of content items (text, image, or embedded resources)
-    """
-
-    client = None
-    try:
-        if MCP_READ_ONLY and name not in READ_ONLY_TOOL_NAMES:
-            raise PermissionError(
-                f"Tool '{name}' is disabled by the MCP read-only policy"
-            )
-
-        client = weknora_client_for_request()
-
-        # Use empty dict if no arguments provided
-        args = arguments or {}
-
-        # Tenant Management - Route tenant-related operations
-        if name == "create_tenant":
-            result = client.create_tenant(
-                args["name"],
-                args["description"],
-                args["business"],
-                # Default to postgres-based keyword and vector search if not specified
-                args.get(
-                    "retriever_engines",
-                    {
-                        "engines": [
-                            {
-                                "retriever_type": "keywords",
-                                "retriever_engine_type": "postgres",
-                            },
-                            {
-                                "retriever_type": "vector",
-                                "retriever_engine_type": "postgres",
-                            },
-                        ]
-                    },
-                ),
-            )
-        elif name == "list_tenants":
-            result = client.list_tenants()
-
-        # Knowledge Base Management - Route knowledge base operations
-        elif name == "create_knowledge_base":
-            # Build configuration with defaults for chunking and models
-            config = {
-                "chunking_config": args.get(
-                    "chunking_config",
-                    {
-                        "chunk_size": 1000,  # Default chunk size in characters
-                        "chunk_overlap": 200,  # Default overlap between chunks
-                        "separators": ["."],  # Default text separators
-                        "enable_multimodal": True,  # Enable image processing by default
-                    },
-                ),
-                "embedding_model_id": args.get("embedding_model_id", ""),
-                "summary_model_id": args.get("summary_model_id", ""),
-            }
-            result = client.create_knowledge_base(
-                args["name"], args["description"], config
-            )
-        elif name == "list_knowledge_bases":
-            result = client.list_knowledge_bases()
-        elif name == "get_knowledge_base":
-            result = client.get_knowledge_base(args["kb_id"])
-        elif name == "delete_knowledge_base":
-            result = client.delete_knowledge_base(args["kb_id"])
-        elif name == "hybrid_search":
-            # Configure hybrid search with thresholds and result count
-            config = {
-                "vector_threshold": args.get(
-                    "vector_threshold", 0.5
-                ),  # Minimum similarity score
-                "keyword_threshold": args.get(
-                    "keyword_threshold", 0.3
-                ),  # Minimum keyword match score
-                "match_count": args.get(
-                    "match_count", 5
-                ),  # Number of results to return
-            }
-            kb_id = client.resolve_kb_id(args["kb_id"])
-            result = client.hybrid_search(kb_id, args["query"], config)
-
-        # Knowledge Management
-        elif name == "create_knowledge_from_file":
-            result = client.create_knowledge_from_file(
-                args["kb_id"], args["file_path"], args.get("enable_multimodel", True)
-            )
-        elif name == "create_knowledge_from_url":
-            result = client.create_knowledge_from_url(
-                args["kb_id"], args["url"], args.get("enable_multimodel", True)
-            )
-        elif name == "list_knowledge":
-            result = client.list_knowledge(
-                args["kb_id"], args.get("page", 1), args.get("page_size", 20)
-            )
-        elif name == "get_knowledge":
-            result = client.get_knowledge(args["knowledge_id"])
-        elif name == "delete_knowledge":
-            result = client.delete_knowledge(args["knowledge_id"])
-
-        # Model Management - Route model configuration operations
-        elif name == "create_model":
-            # Build model parameters (API credentials, endpoints, etc.)
-            parameters = {
-                "base_url": args.get("base_url", ""),  # Model API endpoint
-                "api_key": args.get("api_key", ""),  # Model API key
-            }
-            result = client.create_model(
-                args["name"],
-                args["type"],
-                args.get("source", "local"),
-                args["description"],
-                parameters,
-                args.get("is_default", False),
-            )
-        elif name == "list_models":
-            result = client.list_models()
-        elif name == "get_model":
-            result = client.get_model(args["model_id"])
-
-        # Session Management - Route chat session operations
-        elif name == "create_session":
-            # Create a knowledge-base-bound chat session with strategy configuration.
-            # Strategy includes: max conversation rounds, query rewriting, summarization model,
-            # fallback response handling, and retrieval thresholds (keyword/vector similarity).
-            result = client.create_session(
-                kb_id=client.resolve_kb_id(args["kb_id"]),
-                max_rounds=args.get("max_rounds", 5),
-                enable_rewrite=args.get("enable_rewrite", True),
-                fallback_response=args.get(
-                    "fallback_response", "Sorry, I cannot answer this question."
-                ),
-                summary_model_id=args.get("summary_model_id", ""),
-                title=args.get("title", ""),
-                description=args.get("description", ""),
-            )
-        elif name == "get_session":
-            result = client.get_session(args["session_id"])
-        elif name == "list_sessions":
-            result = client.list_sessions(
-                args.get("page", 1), args.get("page_size", 20)
-            )
-        elif name == "delete_session":
-            result = client.delete_session(args["session_id"])
-
-        # Chat Functionality
-        elif name == "chat":
-            # Resolve KB names → UUIDs to support both human-friendly names and UUIDs
-            raw_kb_ids = args.get("knowledge_base_ids") or []
-            kb_ids = [client.resolve_kb_id(k) for k in raw_kb_ids] if raw_kb_ids else None
-            # Use run_in_executor to avoid blocking the async event loop during
-            # network I/O and SSE streaming. This allows concurrent request handling.
-            fn = functools.partial(
-                client.chat,
-                args["session_id"],
-                args["query"],
-                knowledge_base_ids=kb_ids,
-                web_search_enabled=args.get("web_search_enabled", False),
-            )
-            # get_running_loop() is the correct API inside async functions (get_event_loop() is deprecated)
-            result = await asyncio.get_running_loop().run_in_executor(None, fn)
-
-        elif name == "agent_chat":
-            # Autonomous agent tool-calling: agent decides which tools to invoke (knowledge_search, web_search, etc.)
-            # Unlike RAG chat, the agent pipeline allows multi-step reasoning with explicit tool calls.
-            # Resolve required agent name → UUID
-            agent_id = client.resolve_agent_id(args["agent_id"])
-            # Resolve optional KB overrides (agent may have built-in KBs but user can override)
-            raw_kb_ids = args.get("knowledge_base_ids") or []
-            kb_ids = [client.resolve_kb_id(k) for k in raw_kb_ids] if raw_kb_ids else None
-            # Pre-check: if no KB IDs provided, inspect agent config to detect
-            # kb_selection_mode=none/selected-empty so we fail fast with a clear message
-            # instead of the cryptic backend error "no search targets available".
-            if not kb_ids:
-                try:
-                    # Fetch agent configuration to check KB requirements
-                    agent_info = client.get_agent(agent_id)
-                    cfg = (agent_info.get("data") or agent_info).get("config") or {}
-                    mode = cfg.get("kb_selection_mode", "selected")
-                    built_in_kbs = cfg.get("knowledge_bases") or []
-                    # If mode=none or (mode=selected and no built-in KBs), agent requires explicit KB selection
-                    needs_kbs = (mode == "none") or (mode in ("selected", "") and not built_in_kbs)
-                    if needs_kbs:
-                        kb_list = client.list_knowledge_bases()
-                        kbs = (kb_list.get("data") or kb_list)
-                        if isinstance(kbs, dict):
-                            kbs = kbs.get("list", kbs.get("items", []))
-                        kb_summary = ", ".join(
-                            f"{kb.get('name')} ({kb.get('id')})"
-                            for kb in (kbs or [])[:10]
-                            if isinstance(kb, dict)
-                        )
-                        raise ValueError(
-                            f"Agent '{args['agent_id']}' has kb_selection_mode='{mode}' with no built-in "
-                            f"knowledge bases. You must provide knowledge_base_ids. "
-                            f"Available knowledge bases: [{kb_summary}]"
-                        )
-                except ValueError:
-                    raise
-                except Exception as preflight_err:
-                    logger.warning(f"agent_chat preflight KB check failed (non-fatal): {preflight_err}")
-            fn = functools.partial(
-                client.agent_chat,
-                args["session_id"],
-                args["query"],
-                agent_id,
-                knowledge_base_ids=kb_ids,
-                web_search_enabled=args.get("web_search_enabled", False),
-            )
-            result = await asyncio.get_running_loop().run_in_executor(None, fn)
-
-        elif name == "list_agents":
-            result = client.list_agents(
-                page=args.get("page", 1),
-                page_size=args.get("page_size", 50),
-            )
-
-        elif name == "get_agent":
-            resolved_id = client.resolve_agent_id(args["agent_id"])
-            result = client.get_agent(resolved_id)
-
-        # Chunk Management
-        elif name == "list_chunks":
-            result = client.list_chunks(
-                args["knowledge_id"], args.get("page", 1), args.get("page_size", 20)
-            )
-        elif name == "delete_chunk":
-            result = client.delete_chunk(args["knowledge_id"], args["chunk_id"])
-
-        # Wiki Read-Only - Route wiki query operations
-        elif name == "wiki_search":
-            result = client.wiki_search(
-                args["kb_id"], args["query"], args.get("limit", 10)
-            )
-        elif name == "wiki_read_page":
-            result = client.wiki_read_page(args["kb_id"], args["slug"])
-        elif name == "wiki_index_view":
-            result = client.wiki_index_view(
-                args["kb_id"], args.get("limit", 50)
-            )
-
-        else:
-            # Handle unknown tool names
-            return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
-
-        # Return successful result as formatted JSON
-        return [
-            types.TextContent(
-                type="text", text=json.dumps(result, indent=2, ensure_ascii=False)
-            )
+@mcp.tool()
+def create_tenant(
+    name: str,
+    description: str,
+    business: str,
+    retriever_engines: dict | None = None,
+) -> dict:
+    """Create a new tenant in WeKnora."""
+    engines = retriever_engines or {
+        "engines": [
+            {"retriever_type": "keywords", "retriever_engine_type": "postgres"},
+            {"retriever_type": "vector", "retriever_engine_type": "postgres"},
         ]
-
-    except Exception as e:
-        # Log and return error message
-        logger.error(f"Tool execution failed: {e}")
-        return [
-            types.TextContent(type="text", text=f"Error executing {name}: {str(e)}")
-        ]
-    finally:
-        if client is not None:
-            client.close()
+    }
+    return client.create_tenant(name, description, business, engines)
 
 
-def _init_options() -> InitializationOptions:
-    """Build MCP InitializationOptions (shared across all transports)"""
-    return InitializationOptions(
-        server_name="weknora-server",
-        server_version="0.1.0",
-        capabilities=app.get_capabilities(
-            notification_options=NotificationOptions(),
-            experimental_capabilities={},
-        ),
+@mcp.tool()
+def list_tenants() -> dict:
+    """List all tenants."""
+    return client.list_tenants()
+
+
+@mcp.tool()
+def create_knowledge_base(
+    name: str,
+    description: str,
+    embedding_model_id: str = "",
+    summary_model_id: str = "",
+) -> dict:
+    """Create a new knowledge base."""
+    config = {
+        "chunking_config": {
+            "chunk_size": 1000,
+            "chunk_overlap": 200,
+            "separators": ["."],
+            "enable_multimodal": True,
+        },
+        "embedding_model_id": embedding_model_id,
+        "summary_model_id": summary_model_id,
+    }
+    return client.create_knowledge_base(name, description, config)
+
+
+@mcp.tool()
+def list_knowledge_bases() -> dict:
+    """List all knowledge bases in the current workspace."""
+    return client.list_knowledge_bases()
+
+
+@mcp.tool()
+def list_shared_knowledge_bases() -> dict:
+    """List knowledge bases shared from other workspaces."""
+    return client.list_shared_knowledge_bases()
+
+
+@mcp.tool()
+def get_knowledge_base(kb_id: str) -> dict:
+    """Get knowledge base details."""
+    return client.get_knowledge_base(kb_id)
+
+
+@mcp.tool()
+def delete_knowledge_base(kb_id: str) -> dict:
+    """Delete a knowledge base."""
+    return client.delete_knowledge_base(kb_id)
+
+
+@mcp.tool()
+def hybrid_search(
+    kb_id: str,
+    query: str,
+    vector_threshold: float = 0.5,
+    keyword_threshold: float = 0.3,
+    match_count: int = 5,
+) -> dict:
+    """Perform hybrid (vector + keyword) search in a knowledge base.
+
+    kb_id may be a UUID or a knowledge-base name (resolved automatically).
+    Use list_knowledge_bases or list_shared_knowledge_bases to discover available knowledge bases.
+    """
+    config = {
+        "vector_threshold": vector_threshold,
+        "keyword_threshold": keyword_threshold,
+        "match_count": match_count,
+    }
+    resolved = client.resolve_kb_id(kb_id)
+    return client.hybrid_search(resolved, query, config)
+
+
+@mcp.tool()
+def create_knowledge_from_file(
+    kb_id: str,
+    file_path: str,
+    enable_multimodel: bool = True,
+) -> dict:
+    """Create knowledge from a local file on the server filesystem."""
+    return client.create_knowledge_from_file(kb_id, file_path, enable_multimodel)
+
+
+@mcp.tool()
+def create_knowledge_from_url(
+    kb_id: str,
+    url: str,
+    enable_multimodel: bool = True,
+) -> dict:
+    """Create knowledge from a web URL."""
+    return client.create_knowledge_from_url(kb_id, url, enable_multimodel)
+
+
+@mcp.tool()
+def create_knowledge_from_text(
+    kb_id: str,
+    title: str,
+    content: str,
+    tag_ids: list[str] | None = None,
+    status: str = "publish",
+) -> dict:
+    """Create a knowledge entry from raw Markdown text.
+
+    Use this when you have the document content directly (e.g. an abstract or
+    pasted text) instead of a file path or URL. ``kb_id`` may be a UUID or a
+    knowledge-base name (resolved automatically). ``title`` and ``content``
+    are required. ``status`` defaults to ``"publish"`` so the entry is indexed
+    and searchable immediately; pass ``"draft"`` to save without indexing.
+    """
+    return client.create_knowledge_from_text(
+        client.resolve_kb_id(kb_id), title, content, tag_ids=tag_ids, status=status
     )
 
 
+@mcp.tool()
+def list_knowledge(kb_id: str, page: int = 1, page_size: int = 20) -> dict:
+    """List knowledge entries in a knowledge base."""
+    return client.list_knowledge(kb_id, page, page_size)
+
+
+@mcp.tool()
+def get_knowledge(knowledge_id: str) -> dict:
+    """Get knowledge details."""
+    return client.get_knowledge(knowledge_id)
+
+
+@mcp.tool()
+def delete_knowledge(knowledge_id: str) -> dict:
+    """Delete a knowledge entry."""
+    return client.delete_knowledge(knowledge_id)
+
+
+@mcp.tool()
+def create_model(
+    name: str,
+    type: str,
+    description: str,
+    source: str = "local",
+    base_url: str = "",
+    api_key: str = "",
+    is_default: bool = False,
+) -> dict:
+    """Create a new model configuration (type: KnowledgeQA, Embedding, or Rerank)."""
+    parameters = {"base_url": base_url, "api_key": api_key}
+    return client.create_model(name, type, source, description, parameters, is_default)
+
+
+@mcp.tool()
+def list_models() -> dict:
+    """List all models."""
+    return client.list_models()
+
+
+@mcp.tool()
+def get_model(model_id: str) -> dict:
+    """Get model details."""
+    return client.get_model(model_id)
+
+
+@mcp.tool()
+def create_session(
+    kb_id: str,
+    max_rounds: int = 5,
+    enable_rewrite: bool = True,
+    fallback_response: str = "Sorry, I cannot answer this question.",
+    summary_model_id: str = "",
+    title: str = "",
+    description: str = "",
+) -> dict:
+    """Create a new chat session bound to a knowledge base with a retrieval strategy.
+
+    kb_id may be a UUID or a knowledge-base name (resolved automatically).
+    """
+    return client.create_session(
+        kb_id=client.resolve_kb_id(kb_id),
+        max_rounds=max_rounds,
+        enable_rewrite=enable_rewrite,
+        fallback_response=fallback_response,
+        summary_model_id=summary_model_id,
+        title=title,
+        description=description,
+    )
+
+
+@mcp.tool()
+def get_session(session_id: str) -> dict:
+    """Get session details."""
+    return client.get_session(session_id)
+
+
+@mcp.tool()
+def list_sessions(page: int = 1, page_size: int = 20) -> dict:
+    """List chat sessions."""
+    return client.list_sessions(page, page_size)
+
+
+@mcp.tool()
+def delete_session(session_id: str) -> dict:
+    """Delete a session."""
+    return client.delete_session(session_id)
+
+
+@mcp.tool()
+async def chat(
+    session_id: str,
+    query: str,
+    knowledge_base_ids: list[str] | None = None,
+    web_search_enabled: bool = False,
+) -> dict:
+    """RAG pipeline chat: retrieve relevant chunks from knowledge bases, then summarise with LLM.
+
+    ALWAYS provide knowledge_base_ids (names like 'my-knowledge-base' or UUIDs) so
+    retrieval can run — without them the answer is based on LLM knowledge only.
+    Use list_knowledge_bases or list_shared_knowledge_bases to discover available knowledge bases.
+    For multi-step reasoning or tool-calling use agent_chat instead.
+    """
+    kb_ids = (
+        [client.resolve_kb_id(k) for k in knowledge_base_ids]
+        if knowledge_base_ids
+        else None
+    )
+    fn = functools.partial(
+        client.chat,
+        session_id,
+        query,
+        knowledge_base_ids=kb_ids,
+        web_search_enabled=web_search_enabled,
+    )
+    # get_running_loop() is the correct API inside async functions.
+    return await asyncio.get_running_loop().run_in_executor(None, fn)
+
+
+@mcp.tool()
+async def agent_chat(
+    session_id: str,
+    query: str,
+    agent_id: str,
+    knowledge_base_ids: list[str] | None = None,
+    web_search_enabled: bool = False,
+) -> dict:
+    """Agentic pipeline chat: the agent autonomously calls tools (knowledge_search, web_search, SQL, etc.).
+
+    REQUIRED: agent_id (name or UUID) — use list_agents to discover agents.
+    IMPORTANT: many agents have KBSelectionMode=none and NO built-in knowledge bases.
+    In that case you MUST pass knowledge_base_ids, otherwise the agent will fail
+    with 'no search targets available'. Use get_agent to inspect an agent's
+    kb_selection_mode and knowledge_bases before calling. If kb_selection_mode is
+    'none' or 'selected' with an empty list, always provide knowledge_base_ids.
+    """
+    resolved_agent_id = client.resolve_agent_id(agent_id)
+    kb_ids = (
+        [client.resolve_kb_id(k) for k in knowledge_base_ids]
+        if knowledge_base_ids
+        else None
+    )
+    # Pre-check: if no KB IDs provided, inspect agent config to detect
+    # kb_selection_mode=none/selected-empty so we fail fast with a clear message
+    # instead of the cryptic backend error "no search targets available".
+    if not kb_ids:
+        try:
+            agent_info = client.get_agent(resolved_agent_id)
+            cfg = (agent_info.get("data") or agent_info).get("config") or {}
+            mode = cfg.get("kb_selection_mode", "selected")
+            built_in_kbs = cfg.get("knowledge_bases") or []
+            needs_kbs = (mode == "none") or (
+                mode in ("selected", "") and not built_in_kbs
+            )
+            if needs_kbs:
+                all_kbs = _normalize_kb_entries(
+                    client.list_knowledge_bases()
+                ) + _normalize_kb_entries(client.list_shared_knowledge_bases())
+                seen_ids: set[str] = set()
+                unique_kbs: list[Dict] = []
+                for kb in all_kbs:
+                    kb_id = kb.get("id")
+                    if kb_id and kb_id not in seen_ids:
+                        seen_ids.add(kb_id)
+                        unique_kbs.append(kb)
+                kb_summary = ", ".join(
+                    f"{kb.get('name')} ({kb.get('id')})" for kb in unique_kbs[:10]
+                )
+                raise ValueError(
+                    f"Agent '{agent_id}' has kb_selection_mode='{mode}' with no built-in "
+                    f"knowledge bases. You must provide knowledge_base_ids. "
+                    f"Available knowledge bases: [{kb_summary}]"
+                )
+        except ValueError:
+            raise
+        except Exception as preflight_err:
+            logger.warning(
+                "agent_chat preflight KB check failed (non-fatal): %s", preflight_err
+            )
+    fn = functools.partial(
+        client.agent_chat,
+        session_id,
+        query,
+        resolved_agent_id,
+        knowledge_base_ids=kb_ids,
+        web_search_enabled=web_search_enabled,
+    )
+    return await asyncio.get_running_loop().run_in_executor(None, fn)
+
+
+@mcp.tool()
+def list_agents(page: int = 1, page_size: int = 50) -> dict:
+    """List all custom agents available to the current tenant.
+
+    Use this to discover agent IDs, names, and their KB selection mode before
+    calling agent_chat.
+    """
+    return client.list_agents(page=page, page_size=page_size)
+
+
+@mcp.tool()
+def get_agent(agent_id: str) -> dict:
+    """Get full configuration of a single agent by UUID or name.
+
+    Check kb_selection_mode and knowledge_bases fields: if kb_selection_mode is
+    'none' or 'selected' with an empty knowledge_bases list, you MUST pass
+    knowledge_base_ids when calling agent_chat.
+    """
+    resolved_id = client.resolve_agent_id(agent_id)
+    return client.get_agent(resolved_id)
+
+
+@mcp.tool()
+def list_chunks(knowledge_id: str, page: int = 1, page_size: int = 20) -> dict:
+    """List chunks (text segments) of a knowledge entry."""
+    return client.list_chunks(knowledge_id, page, page_size)
+
+
+@mcp.tool()
+def delete_chunk(knowledge_id: str, chunk_id: str) -> dict:
+    """Delete a chunk."""
+    return client.delete_chunk(knowledge_id, chunk_id)
+
+
+@mcp.tool()
+def wiki_search(kb_id: str, query: str, limit: int = 10) -> dict:
+    """Search wiki pages by full-text query.
+
+    Returns matching wiki pages with title, slug, summary, and content snippets.
+    """
+    return client.wiki_search(kb_id, query, limit)
+
+
+@mcp.tool()
+def wiki_read_page(kb_id: str, slug: str) -> dict:
+    """Read a wiki page by its slug.
+
+    Returns full markdown content, metadata, inbound/outbound links, and source
+    references. slug example: 'entity/acme-corp', 'concept/rag'.
+    """
+    return client.wiki_read_page(kb_id, slug)
+
+
+@mcp.tool()
+def wiki_index_view(kb_id: str, limit: int = 50) -> dict:
+    """Get a structured wiki index with per-type directory groups.
+
+    Returns an overview of all wiki pages organized by type (entity, concept,
+    summary, etc.).
+    """
+    return client.wiki_index_view(kb_id, limit)
+
+
+# ---------------------------------------------------------------------------
+# Transports
+# ---------------------------------------------------------------------------
+
+
 async def run_stdio():
-    """Run the MCP server using stdio transport"""
+    """Run the MCP server using stdio transport."""
     set_active_transport("stdio")
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, _init_options())
+    await mcp.run_stdio_async()
 
 
 async def run_sse(host: str, port: int):
-    """Run the MCP server using SSE transport (legacy MCP clients)"""
+    """Run the MCP server using SSE transport (legacy MCP clients)."""
     set_active_transport("sse")
     auth_token = require_network_transport_auth("sse")
-    auth_mode = network_transport_auth_mode()
     try:
-        from mcp.server.sse import SseServerTransport
-        from starlette.applications import Starlette
-        from starlette.routing import Mount
         import uvicorn
     except ImportError as e:
         raise ImportError(
             f"SSE transport requires 'starlette' and 'uvicorn': pip install starlette uvicorn\n{e}"
         ) from e
 
-    sse = SseServerTransport("/messages/")
-
-    # Use a raw ASGI callable instead of a Starlette Request endpoint to avoid
-    # accessing Starlette's private _send attribute (which can break across versions).
-    async def handle_sse(scope, receive, send):
-        async with sse.connect_sse(scope, receive, send) as streams:
-            await app.run(streams[0], streams[1], _init_options())
-
-    starlette_app = Starlette(
-        routes=[
-            Mount("/sse", app=handle_sse),
-            Mount("/messages/", app=sse.handle_post_message),
-        ]
+    starlette_app = MCPAuthMiddleware(
+        mcp.sse_app(host=host, message_path=SSE_MESSAGE_PATH),
+        auth_token,
     )
-    starlette_app = MCPAuthMiddleware(starlette_app, auth_token, auth_mode=auth_mode)
 
     logger.info("Starting SSE MCP server on %s:%d", host, port)
     logger.info("SSE endpoint:  http://%s:%d/sse", host, port)
+    logger.info("SSE messages: http://%s:%d%s", host, port, SSE_MESSAGE_PATH)
     config = uvicorn.Config(starlette_app, host=host, port=port, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
 
 
 async def run_http(host: str, port: int):
-    """Run the MCP server using Streamable HTTP transport (MCP 2025-03-26 spec)"""
+    """Run the MCP server using Streamable HTTP transport (MCP 2025-03-26 spec)."""
     set_active_transport("http")
     auth_token = require_network_transport_auth("http")
-    auth_mode = network_transport_auth_mode()
     try:
-        from contextlib import asynccontextmanager
-        from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-        from starlette.applications import Starlette
-        from starlette.routing import Mount
         import uvicorn
     except ImportError as e:
         raise ImportError(
             f"HTTP transport requires 'starlette' and 'uvicorn': pip install starlette uvicorn\n{e}"
         ) from e
 
-    session_manager = StreamableHTTPSessionManager(
-        app=app,
-        event_store=None,
-        json_response=False,
-        stateless=True,
+    starlette_app = MCPAuthMiddleware(
+        mcp.streamable_http_app(host=host, stateless_http=STREAMABLE_HTTP_STATELESS),
+        auth_token,
     )
-
-    @asynccontextmanager
-    async def lifespan(_app):
-        async with session_manager.run():
-            yield
-
-    starlette_app = Starlette(
-        routes=[Mount("/", app=session_manager.handle_request)],
-        lifespan=lifespan,
-    )
-    starlette_app = MCPAuthMiddleware(starlette_app, auth_token, auth_mode=auth_mode)
-    starlette_app = MCPPathPrefixMiddleware(starlette_app, MCP_HTTP_PATH)
 
     logger.info("Starting Streamable HTTP MCP server on %s:%d", host, port)
-    logger.info("MCP endpoint:  http://%s:%d%s", host, port, MCP_HTTP_PATH)
+    logger.info("MCP endpoint:  http://%s:%d/mcp", host, port)
     config = uvicorn.Config(starlette_app, host=host, port=port, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
@@ -1692,6 +1072,7 @@ async def run_http(host: str, port: int):
 
 # Backward-compatible alias used by run_server.py
 run = run_stdio
+
 
 
 def main():

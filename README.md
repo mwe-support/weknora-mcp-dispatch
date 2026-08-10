@@ -1,186 +1,157 @@
-# WeKnora MCP Dispatch
+# WeKnora MCP Server
 
-面向 WeKnora v0.7.1 的多用户 MCP 网关。一个 Streamable HTTP MCP
-服务实例可以接收多个客户端请求，并以客户端提交的 WeKnora API Key
-决定其可访问的空间和知识库。
+这是一个 Model Context Protocol (MCP) 服务器，提供对 WeKnora 知识管理 API 的访问。
 
-本项目基于 WeKnora MCP Server 改造，重点解决单个服务端静态 API Key
-无法实现客户端权限隔离的问题。
+## 快速开始
 
-## 鉴权链路
+> 推荐直接参考 [MCP配置说明](./MCP_CONFIG.md)，无需进行以下操作。
 
-```text
-MCP client
-  ├─ 可选：Cloudflare Access Service Token
-  └─ Authorization: Bearer <WeKnora API Key>
-          ↓
-WeKnora MCP Dispatch
-  ├─ 使用只读 /knowledge-bases 请求验证 API Key
-  ├─ 将 Key 绑定到当前异步请求上下文
-  └─ 以 X-API-Key 转发到 WeKnora API
-          ↓
-WeKnora v0.7.1
+### 1. 安装依赖
+```bash
+pip install -r requirements.txt
 ```
 
-不同客户端不共享静态 WeKnora Key。请求级 Key 使用 Python `ContextVar`
-隔离，即使请求重叠执行，也不会把一个客户端的身份转发给另一个客户端。
+### 2. 配置环境变量
+```bash
+# Linux/macOS
+export WEKNORA_BASE_URL="http://localhost:8080/api/v1"
+export WEKNORA_API_KEY="your_api_key_here"
 
-## 安全特性
+# Windows PowerShell
+$env:WEKNORA_BASE_URL="http://localhost:8080/api/v1"
+$env:WEKNORA_API_KEY="your_api_key_here"
 
-- 公网 MCP 只接受 `Authorization: Bearer <WeKnora API Key>`。
-- 不接受外部 `X-API-Key` 作为第二条认证通道。
-- API Key 通过 WeKnora 的只读接口验证。
-- 验证缓存只保存 SHA-256 指纹，不保存原始 Key。
-- 缓存条目数、TTL 和验证并发均有上限。
-- 上游临时限流或不可用返回 `503`，不会误判 Key 永久无效。
-- `MCP_READ_ONLY=true` 时只注册/允许知识库查询工具。
-- `MCP_HTTP_PATH=/mcp` 时仅接受 `/mcp` 与 `/mcp/`。
-- 动态 Key 模式不会回退到 `WEKNORA_API_KEY` 静态环境变量。
+# Windows CMD
+set WEKNORA_BASE_URL=http://localhost:8080/api/v1
+set WEKNORA_API_KEY=your_api_key_here
+```
 
-## 只读工具
+### 3. 运行服务器
 
-生产只读模式允许：
+**推荐方式 - 使用主入口点：**
+```bash
+python main.py
+```
 
-- `list_knowledge_bases`
-- `get_knowledge_base`
-- `hybrid_search`
-- `list_knowledge`
-- `get_knowledge`
-- `list_chunks`
-- `list_agents`
-- `get_agent`
-- `wiki_search`
-- `wiki_read_page`
-- `wiki_index_view`
+**其他运行方式：**
+```bash
+# 使用原始启动脚本
+python run_server.py
 
-## Docker 运行
+# 使用便捷脚本
+python run.py
+
+# 直接运行服务器模块
+python weknora_mcp_server.py
+
+# 作为 Python 模块运行
+python -m weknora_mcp_server
+```
+
+### 4. 命令行选项
+```bash
+python main.py --help                 # 显示帮助信息
+python main.py --check-only           # 仅检查环境配置
+python main.py --verbose              # 启用详细日志
+python main.py --version              # 显示版本信息
+```
+
+## 安装为 Python 包
+
+### 从 PyPI 安装
 
 ```bash
-docker build -t weknora-mcp-dispatch:0.1.0 .
-
-docker run --rm \
-  --name weknora-mcp-dispatch \
-  -p 127.0.0.1:18082:8000 \
-  -e WEKNORA_BASE_URL=http://app:8080/api/v1 \
-  -e MCP_AUTH_MODE=weknora_api_key \
-  -e MCP_READ_ONLY=true \
-  -e MCP_HTTP_PATH=/mcp \
-  -e MCP_API_KEY_VALIDATION_TTL_SECONDS=60 \
-  -e MCP_API_KEY_VALIDATION_CACHE_MAX_ENTRIES=2048 \
-  -e MCP_API_KEY_VALIDATION_MAX_CONCURRENCY=16 \
-  -e WEKNORA_API_KEY= \
-  -e MCP_SERVER_AUTH_TOKEN= \
-  weknora-mcp-dispatch:0.1.0
+pip install tencent-weknora-mcp
+# 或使用 uvx 直接运行（无需预安装）
+uvx --from tencent-weknora-mcp weknora-mcp-server
 ```
 
-如使用 WeKnora 官方 Compose，可参考
-[`production.request-scoped.override.yml`](./production.request-scoped.override.yml)
-为现有 `mcp` 服务启用请求级鉴权。
+> 官方 PyPI 包名为 **`tencent-weknora-mcp`**（Tencent/WeKnora 维护，Trusted Publishing 发布）。
+> 旧社区包 `weknora-mcp` 请不要再使用。
+> 安装后命令行入口仍为 `weknora-mcp-server` / `weknora-server`。
 
-## 客户端请求头
-
-直接访问 MCP：
-
-```http
-Authorization: Bearer <WEKNORA_SPACE_API_KEY>
-```
-
-如果外层使用 Cloudflare Access Service Token：
-
-```http
-CF-Access-Client-Id: <CLOUDFLARE_SERVICE_TOKEN_CLIENT_ID>
-CF-Access-Client-Secret: <CLOUDFLARE_SERVICE_TOKEN_CLIENT_SECRET>
-Authorization: Bearer <WEKNORA_SPACE_API_KEY>
-```
-
-Cloudflare 负责公网入口鉴权，WeKnora API Key 负责用户/空间权限控制；两层可以同时启用。
-
-## WorkBuddy 配置示例
-
-WorkBuddy 支持用户级 `~/.workbuddy/mcp.json` 和项目级
-`<项目目录>/.workbuddy/mcp.json`。以下示例通过环境变量保存凭据：
-
-```json
-{
-  "mcpServers": {
-    "weknora": {
-      "type": "http",
-      "url": "https://kb.example.com/mcp",
-      "headers": {
-        "Authorization": "Bearer ${WEKNORA_SPACE_API_KEY}",
-        "CF-Access-Client-Id": "${CF_ACCESS_CLIENT_ID}",
-        "CF-Access-Client-Secret": "${CF_ACCESS_CLIENT_SECRET}"
-      }
-    }
-  }
-}
-```
-
-将 `url` 替换为实际 MCP 地址，并在启动 WorkBuddy 前设置三个环境变量。
-如果没有启用 Cloudflare Access Service Token，删除两个 `CF-Access-*` 请求头即可。
-保存配置后，在 WorkBuddy 的 MCP 页面确认服务状态为绿色。
-
-参考：[WorkBuddy MCP 配置说明](https://www.codebuddy.cn/docs/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/MCP-Guide)、
-[HTTP MCP 配置字段](https://www.codebuddy.cn/docs/cli/mcp)。
-
-## Codex 配置示例
-
-在 `~/.codex/config.toml` 中加入：
-
-```toml
-[mcp_servers.weknora]
-url = "https://kb.example.com/mcp"
-bearer_token_env_var = "WEKNORA_SPACE_API_KEY"
-env_http_headers = { "CF-Access-Client-Id" = "CF_ACCESS_CLIENT_ID", "CF-Access-Client-Secret" = "CF_ACCESS_CLIENT_SECRET" }
-```
-
-Codex 会从 `WEKNORA_SPACE_API_KEY` 读取 Bearer Token，并从另外两个环境变量
-生成 Cloudflare Access 请求头。未启用 Cloudflare Access Service Token 时，删除
-`env_http_headers` 这一行即可。设置环境变量后重启 Codex，再通过 `codex mcp list`
-确认服务已加载。
-
-不建议把 WeKnora API Key 或 Cloudflare Client Secret 明文提交到配置仓库。
-
-## 环境变量
-
-| 变量 | 推荐值 | 说明 |
-| --- | --- | --- |
-| `WEKNORA_BASE_URL` | `http://app:8080/api/v1` | WeKnora API 地址 |
-| `MCP_AUTH_MODE` | `weknora_api_key` | 启用请求级 WeKnora Key |
-| `MCP_READ_ONLY` | `true` | 禁止写入类 MCP 工具 |
-| `MCP_HTTP_PATH` | `/mcp` | 对外 MCP 路径 |
-| `MCP_API_KEY_VALIDATION_TTL_SECONDS` | `60` | Key 验证缓存 TTL |
-| `MCP_API_KEY_VALIDATION_CACHE_MAX_ENTRIES` | `2048` | 最大缓存指纹数 |
-| `MCP_API_KEY_VALIDATION_MAX_CONCURRENCY` | `16` | 最大并发验证数 |
-| `WEKNORA_VERIFY_SSL` | `true` | 验证 WeKnora HTTPS 证书 |
-
-请求级模式下应保持 `WEKNORA_API_KEY` 和 `MCP_SERVER_AUTH_TOKEN` 为空。
-
-## HTTP 结果
-
-| 状态码 | 含义 |
-| --- | --- |
-| `401` | 缺少 WeKnora API Key |
-| `403` | Key 无效或不可用于 WeKnora API |
-| `404` | 请求路径不在配置的 MCP 精确路径内 |
-| `503` | WeKnora Key 验证暂时不可用或并发受限 |
-
-## 本地测试
-
+### 开发模式安装
 ```bash
-python -m pip install -e ".[test]"
-pytest
+pip install -e .
 ```
 
-测试覆盖缺失/无效 Key、外部 `X-API-Key` 拒绝、重叠请求身份隔离、
-缓存不保存原始 Key、临时限流、Streamable HTTP 任务上下文继承和精确路径限制。
+安装后可以使用命令行工具：
+```bash
+weknora-mcp-server
+# 或
+weknora-server
+```
 
-## 兼容模式
+### 生产模式安装
+```bash
+pip install .
+```
 
-项目仍保留上游 `shared_secret` 模式，便于兼容旧客户端；多用户生产部署应使用
-`MCP_AUTH_MODE=weknora_api_key`。
+### 构建分发包
+```bash
+# 使用 setuptools
+python setup.py sdist bdist_wheel
 
-## 上游与许可证
+# 使用现代构建工具
+pip install build
+python -m build
+```
 
-本项目基于 WeKnora MCP Server 及其 MIT 许可代码改造。原始项目资料和兼容说明
-保留在仓库文档中；本仓库的生产入口重点面向 WeKnora v0.7.1 多用户派发场景。
+## 测试模组
+
+运行测试脚本验证模组是否正常工作：
+```bash
+python test_module.py
+```
+
+## 功能特性
+
+该 MCP 服务器提供以下工具：
+
+### 空间管理
+- `create_tenant` - 创建新空间
+- `list_tenants` - 列出所有空间
+
+### 知识库管理
+- `create_knowledge_base` - 创建知识库
+- `list_knowledge_bases` - 列出知识库
+- `get_knowledge_base` - 获取知识库详情
+- `delete_knowledge_base` - 删除知识库
+- `hybrid_search` - 混合搜索
+
+### 知识管理
+- `create_knowledge_from_file` - 从本地文件创建知识
+- `create_knowledge_from_url` - 从 URL 创建知识
+- `create_knowledge_from_text` - 从文本创建知识
+- `list_knowledge` - 列出知识
+- `get_knowledge` - 获取知识详情
+- `delete_knowledge` - 删除知识
+
+### 模型管理
+- `create_model` - 创建模型
+- `list_models` - 列出模型
+- `get_model` - 获取模型详情
+
+### 会话管理
+- `create_session` - 创建聊天会话
+- `get_session` - 获取会话详情
+- `list_sessions` - 列出会话
+- `delete_session` - 删除会话
+
+### 聊天功能
+- `chat` - 发送聊天消息
+
+### 块管理
+- `list_chunks` - 列出知识块
+- `delete_chunk` - 删除知识块
+
+## 故障排除
+
+如果遇到导入错误，请确保：
+1. 已安装所有必需的依赖包
+2. Python 版本兼容（推荐 3.10+）
+3. 没有文件名冲突（避免使用 `mcp.py` 作为文件名）
+
+## 调用效果
+
+<img width="950" height="2063" alt="118d078426f42f3d4983c13386085d7f" src="https://github.com/user-attachments/assets/09111ec8-0489-415c-969d-aa3835778e14" />
