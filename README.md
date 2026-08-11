@@ -22,7 +22,10 @@
 - API Key 仅绑定到当前 MCP 请求上下文，异步任务和同步工具工作线程均保持租户隔离。
 - 动态 Key 模式不会回退到服务端静态 `WEKNORA_API_KEY`，上下文丢失时失败关闭。
 - 验证缓存只保存 SHA-256 指纹；缓存容量、TTL 和验证并发均有上限。
-- `MCP_READ_ONLY=true`：从 MCP 2.x 工具注册表移除写入、会话和聊天工具。
+- 生产环境设置 `MCP_READ_ONLY=false`，暴露官方 30 个工具；每次调用仍由请求中的
+  WeKnora API Key 在后端执行真实权限校验。需要纯查询端点时可改回 `true`。
+- `create_knowledge_from_file` 只允许读取 `MCP_ALLOWED_UPLOAD_DIRS` 下的服务端文件；
+  生产 Compose 将专用宿主机目录只读挂载到 `/uploads`，不允许扫描容器工作目录。
 - 保留上游 `shared_secret` 和 stdio 模式，便于兼容原有部署。
 
 请求链路：
@@ -55,8 +58,10 @@ docker build -t local/weknora-mcp-dispatch:v0.7.2 .
 | --- | --- | --- |
 | `WEKNORA_BASE_URL` | `http://app:8080/api/v1` | WeKnora API 地址 |
 | `MCP_AUTH_MODE` | `weknora_api_key` | 启用请求级空间 Key |
-| `MCP_READ_ONLY` | `true` | 仅暴露知识查询工具 |
+| `MCP_READ_ONLY` | `false` | 暴露全部 30 个工具，实际权限由请求 API Key 决定 |
 | `MCP_HTTP_PATH` | `/mcp` | Streamable HTTP 路径 |
+| `MCP_ALLOWED_UPLOAD_DIRS` | `/uploads` | 文件导入工具唯一可读取的服务端目录 |
+| `MCP_UPLOAD_HOST_DIR` | `/public/knowledgebase/mcp-uploads` | 只读挂载到 `/uploads` 的宿主机目录 |
 | `MCP_API_KEY_VALIDATION_TTL_SECONDS` | `60` | 验证缓存 TTL |
 | `MCP_API_KEY_VALIDATION_CACHE_MAX_ENTRIES` | `2048` | 最大缓存指纹数 |
 | `MCP_API_KEY_VALIDATION_MAX_CONCURRENCY` | `16` | 最大并发验证数 |
