@@ -1,0 +1,8 @@
+{
+  "clean_backend": "http://WeKnora-clean-app:8080/api/v1",
+  "endpoint": "http://127.0.0.1:28182/mcp",
+  "image_id": "sha256:baf882f167f0df5fb463699536370cd587b2ed5e69af6b1e23265023bad1bf84",
+  "unauthenticated_status": 401,
+  "production_unchanged": true,
+  "source_commit": "1b1687401671c501d4d2431e6aab8cf5ad3d8586"
+}

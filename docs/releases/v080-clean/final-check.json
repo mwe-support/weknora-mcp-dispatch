@@ -1,0 +1,23 @@
+{
+  "production_mcp_unchanged": true,
+  "clean_backend": "http://WeKnora-clean-app:8080/api/v1",
+  "auth_mode": "weknora_api_key",
+  "static_key_configured": false,
+  "active_temporary_keys": 0,
+  "active_fixture_kbs": 0,
+  "active_fixture_spaces": 0,
+  "business_knowledge_count": 2043,
+  "runtime": {
+    "sdk": "2.0.0",
+    "files": {
+      "weknora_mcp_server.py": "c4881dc40ee97552dbf335714304a98fe660bd1cbf7e92ef41df7c339e2b9dbf",
+      "weknora_mcp_auth.py": "38165648b6afca74ee8a650d5bec08f16ca0329c262fe6792f8daac98c6c02a9",
+      "upload_paths.py": "dcefc394e16b43911aeb59219632224f5fc9e6f27bcd8a0a2595c5e15e8e36a5"
+    }
+  },
+  "source_matches_runtime": {
+    "weknora_mcp_server.py": true,
+    "weknora_mcp_auth.py": true,
+    "upload_paths.py": true
+  }
+}

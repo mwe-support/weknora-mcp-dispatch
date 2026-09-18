@@ -1,8 +1,11 @@
 # WeKnora MCP Dispatch
 
-这是面向 WeKnora v0.7.2 的多用户 MCP 网关，基于官方 MCP Server 1.1.1
+这是面向 WeKnora v0.7.2、已实测兼容 v0.8.0 的多用户 MCP 网关，基于官方 MCP Server 1.1.1
 （MCP Python SDK 2.x 高层 API）改造。一个 Streamable HTTP 服务实例可以接收
 多个客户端请求，并以每个客户端提交的 WeKnora API Key 决定其可访问的空间和知识库。
+
+v0.8.0 的真实协议、读写、检索、对话及权限验证结果见
+[clean MCP 兼容验收](docs/releases/2026-09-18-v080-clean-mcp-acceptance.md)，包含未覆盖范围和回滚方式。
 
 ## 上游优先的模块结构
 
