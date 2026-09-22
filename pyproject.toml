@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "weknora-mcp-dispatch"
 version = "0.2.0"
-description = "Request-scoped multi-user MCP gateway for WeKnora v0.7.2"
+description = "Request-scoped multi-user MCP gateway for WeKnora v0.8.0"
 readme = "README.md"
 license = "MIT"
 authors = [

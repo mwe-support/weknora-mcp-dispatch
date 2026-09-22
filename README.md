@@ -1,6 +1,8 @@
 # WeKnora MCP Dispatch
 
-这是面向 WeKnora v0.7.2、已实测兼容 v0.8.0 的多用户 MCP 网关，基于官方 MCP Server 1.1.1
+当前维护与GitHub默认分支为`weknora-v0.8.0`，`main`同步同版内容；[本批整理与复审](docs/releases/2026-09-22-v080-github-publication.md)。历史v0.7.2不再接收当前版本定制。
+
+这是当前面向 WeKnora v0.8.0 的多用户 MCP 网关，基于官方 MCP Server 1.1.1
 （MCP Python SDK 2.x 高层 API）改造。一个 Streamable HTTP 服务实例可以接收
 多个客户端请求，并以每个客户端提交的 WeKnora API Key 决定其可访问的空间和知识库。
 
@@ -59,7 +61,7 @@ docker build -t local/weknora-mcp-dispatch:v0.7.2 .
 
 | 变量 | 推荐值 | 说明 |
 | --- | --- | --- |
-| `WEKNORA_BASE_URL` | `http://app:8080/api/v1` | WeKnora API 地址 |
+| `WEKNORA_BASE_URL` | `http://WeKnora-app:8080/api/v1` | WeKnora API 地址 |
 | `MCP_AUTH_MODE` | `weknora_api_key` | 启用请求级空间 Key |
 | `MCP_READ_ONLY` | `false` | 暴露全部 30 个工具，实际权限由请求 API Key 决定 |
 | `MCP_HTTP_PATH` | `/mcp` | Streamable HTTP 路径 |

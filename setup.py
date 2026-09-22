@@ -12,7 +12,7 @@ def read_readme():
         with open("README.md", "r", encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
-        return "Request-scoped multi-user MCP gateway for WeKnora v0.7.2"
+        return "Request-scoped multi-user MCP gateway for WeKnora v0.8.0"
 
 
 # 读取依赖
@@ -37,7 +37,7 @@ setup(
     author="WeKnora Team",
     author_email="support@weknora.com",
     maintainer="MWE Support",
-    description="Request-scoped multi-user MCP gateway for WeKnora v0.7.2",
+    description="Request-scoped multi-user MCP gateway for WeKnora v0.8.0",
     long_description=read_readme(),
     long_description_content_type="text/markdown",
     url="https://github.com/mwe-support/weknora-mcp-dispatch",
