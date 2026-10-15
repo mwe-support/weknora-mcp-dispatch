@@ -8,17 +8,19 @@ A Model Context Protocol server that provides access to the WeKnora knowledge ma
 import argparse
 import asyncio
 import functools
+import inspect
 import json
 import logging
 import os
 import re
 import sys
 import threading
-from typing import Any, Dict
+from typing import Annotated, Any, Dict
 
 import urllib3
 import requests
 from mcp.server import MCPServer
+from pydantic import Field
 from requests.exceptions import RequestException
 from upload_paths import resolve_upload_file_path, set_active_transport
 from weknora_mcp_auth import (
@@ -597,7 +599,25 @@ class WeKnoraClient:
 # Initialize MCP server instance (mcp 2.x high-level API).
 # MCPServer (formerly FastMCP) builds input schemas from function type hints
 # and serializes plain return values automatically.
-mcp = MCPServer("weknora-server", version="1.1.1")
+TenantID = Annotated[
+    int,
+    Field(strict=True, gt=0, le=2**64 - 1,
+          description="Workspace ID from list_tenants(all_spaces=True); overrides X-Tenant-ID for this call."),
+]
+mcp = MCPServer(
+    "weknora-server", version="1.1.1",
+    instructions=(
+        "Use list_tenants(all_spaces=True) to discover workspaces with a platform API Key. "
+        "Then use list_knowledge_bases(tenant_id=<id>) and carry tenant_id into reads and searches. "
+        "If the user does not name a workspace, discover workspaces and candidate knowledge bases yourself; "
+        "do not require the user to supply IDs. Search relevant authorized sources and identify their "
+        "workspace and knowledge base in your answer. "
+        "Consider all discovered spaces when choosing sources; a selected search is not exhaustive. "
+        "tenant_id is per call and overrides the HTTP workspace header; omit it to retain the header. "
+        "Reading requires retrieve; all-space discovery requires system_tenants_read or system_tenants_manage. "
+        "Use read tools unless the user explicitly requests changes."
+    ),
+)
 
 # Shared-secret and stdio transports retain the deployment API key. Dynamic
 # HTTP mode never falls back to it, so a lost request context fails closed.
@@ -610,6 +630,25 @@ _CLIENT_PROVIDER = RequestScopedClientProvider(
     request_scoped_mode=lambda: AUTH_SETTINGS.request_scoped,
 )
 client = RequestScopedClientProxy(_CLIENT_PROVIDER)
+
+
+def tool_tenant(function):
+    """Route sync and async tools without changing their MCP schemas or bodies."""
+    signature = inspect.signature(function)
+
+    @functools.wraps(function)
+    def sync(*args, **kwargs):
+        tenant_id = signature.bind(*args, **kwargs).arguments.get("tenant_id")
+        with _CLIENT_PROVIDER.use_tenant(tenant_id):
+            return function(*args, **kwargs)
+
+    @functools.wraps(function)
+    async def asynchronous(*args, **kwargs):
+        tenant_id = signature.bind(*args, **kwargs).arguments.get("tenant_id")
+        with _CLIENT_PROVIDER.use_tenant(tenant_id):
+            return await function(*args, **kwargs)
+
+    return asynchronous if inspect.iscoroutinefunction(function) else sync
 
 
 # ---------------------------------------------------------------------------
@@ -642,17 +681,20 @@ def create_tenant(
 
 
 @mcp.tool()
-def list_tenants(all_spaces: bool = False) -> dict:
+@tool_tenant
+def list_tenants(all_spaces: bool = False, tenant_id: TenantID | None = None) -> dict:
     """List workspaces. all_spaces=True requires a platform key with system_tenants_read or system_tenants_manage."""
     return client.list_tenants(all_spaces=all_spaces)
 
 
 @mcp.tool()
+@tool_tenant
 def create_knowledge_base(
     name: str,
     description: str,
     embedding_model_id: str = "",
     summary_model_id: str = "",
+    tenant_id: TenantID | None = None,
 ) -> dict:
     """Create a new knowledge base."""
     config = {
@@ -669,36 +711,42 @@ def create_knowledge_base(
 
 
 @mcp.tool()
-def list_knowledge_bases() -> dict:
+@tool_tenant
+def list_knowledge_bases(tenant_id: TenantID | None = None) -> dict:
     """List all knowledge bases in the current workspace."""
     return client.list_knowledge_bases()
 
 
 @mcp.tool()
-def list_shared_knowledge_bases() -> dict:
+@tool_tenant
+def list_shared_knowledge_bases(tenant_id: TenantID | None = None) -> dict:
     """List knowledge bases shared from other workspaces."""
     return client.list_shared_knowledge_bases()
 
 
 @mcp.tool()
-def get_knowledge_base(kb_id: str) -> dict:
+@tool_tenant
+def get_knowledge_base(kb_id: str, tenant_id: TenantID | None = None) -> dict:
     """Get knowledge base details."""
     return client.get_knowledge_base(kb_id)
 
 
 @mcp.tool()
-def delete_knowledge_base(kb_id: str) -> dict:
+@tool_tenant
+def delete_knowledge_base(kb_id: str, tenant_id: TenantID | None = None) -> dict:
     """Delete a knowledge base."""
     return client.delete_knowledge_base(kb_id)
 
 
 @mcp.tool()
+@tool_tenant
 def hybrid_search(
     kb_id: str,
     query: str,
     vector_threshold: float = 0.5,
     keyword_threshold: float = 0.3,
     match_count: int = 5,
+    tenant_id: TenantID | None = None,
 ) -> dict:
     """Perform hybrid (vector + keyword) search in a knowledge base.
 
@@ -715,32 +763,38 @@ def hybrid_search(
 
 
 @mcp.tool()
+@tool_tenant
 def create_knowledge_from_file(
     kb_id: str,
     file_path: str,
     enable_multimodel: bool = True,
+    tenant_id: TenantID | None = None,
 ) -> dict:
     """Create knowledge from a local file on the server filesystem."""
     return client.create_knowledge_from_file(kb_id, file_path, enable_multimodel)
 
 
 @mcp.tool()
+@tool_tenant
 def create_knowledge_from_url(
     kb_id: str,
     url: str,
     enable_multimodel: bool = True,
+    tenant_id: TenantID | None = None,
 ) -> dict:
     """Create knowledge from a web URL."""
     return client.create_knowledge_from_url(kb_id, url, enable_multimodel)
 
 
 @mcp.tool()
+@tool_tenant
 def create_knowledge_from_text(
     kb_id: str,
     title: str,
     content: str,
     tag_ids: list[str] | None = None,
     status: str = "publish",
+    tenant_id: TenantID | None = None,
 ) -> dict:
     """Create a knowledge entry from raw Markdown text.
 
@@ -756,24 +810,28 @@ def create_knowledge_from_text(
 
 
 @mcp.tool()
-def list_knowledge(kb_id: str, page: int = 1, page_size: int = 20) -> dict:
+@tool_tenant
+def list_knowledge(kb_id: str, page: int = 1, page_size: int = 20, tenant_id: TenantID | None = None) -> dict:
     """List knowledge entries in a knowledge base."""
     return client.list_knowledge(kb_id, page, page_size)
 
 
 @mcp.tool()
-def get_knowledge(knowledge_id: str) -> dict:
+@tool_tenant
+def get_knowledge(knowledge_id: str, tenant_id: TenantID | None = None) -> dict:
     """Get knowledge details."""
     return client.get_knowledge(knowledge_id)
 
 
 @mcp.tool()
-def delete_knowledge(knowledge_id: str) -> dict:
+@tool_tenant
+def delete_knowledge(knowledge_id: str, tenant_id: TenantID | None = None) -> dict:
     """Delete a knowledge entry."""
     return client.delete_knowledge(knowledge_id)
 
 
 @mcp.tool()
+@tool_tenant
 def create_model(
     name: str,
     type: str,
@@ -782,6 +840,7 @@ def create_model(
     base_url: str = "",
     api_key: str = "",
     is_default: bool = False,
+    tenant_id: TenantID | None = None,
 ) -> dict:
     """Create a new model configuration (type: KnowledgeQA, Embedding, or Rerank)."""
     parameters = {"base_url": base_url, "api_key": api_key}
@@ -789,18 +848,21 @@ def create_model(
 
 
 @mcp.tool()
-def list_models() -> dict:
+@tool_tenant
+def list_models(tenant_id: TenantID | None = None) -> dict:
     """List all models."""
     return client.list_models()
 
 
 @mcp.tool()
-def get_model(model_id: str) -> dict:
+@tool_tenant
+def get_model(model_id: str, tenant_id: TenantID | None = None) -> dict:
     """Get model details."""
     return client.get_model(model_id)
 
 
 @mcp.tool()
+@tool_tenant
 def create_session(
     kb_id: str,
     max_rounds: int = 5,
@@ -809,6 +871,7 @@ def create_session(
     summary_model_id: str = "",
     title: str = "",
     description: str = "",
+    tenant_id: TenantID | None = None,
 ) -> dict:
     """Create a new chat session bound to a knowledge base with a retrieval strategy.
 
@@ -826,29 +889,34 @@ def create_session(
 
 
 @mcp.tool()
-def get_session(session_id: str) -> dict:
+@tool_tenant
+def get_session(session_id: str, tenant_id: TenantID | None = None) -> dict:
     """Get session details."""
     return client.get_session(session_id)
 
 
 @mcp.tool()
-def list_sessions(page: int = 1, page_size: int = 20) -> dict:
+@tool_tenant
+def list_sessions(page: int = 1, page_size: int = 20, tenant_id: TenantID | None = None) -> dict:
     """List chat sessions."""
     return client.list_sessions(page, page_size)
 
 
 @mcp.tool()
-def delete_session(session_id: str) -> dict:
+@tool_tenant
+def delete_session(session_id: str, tenant_id: TenantID | None = None) -> dict:
     """Delete a session."""
     return client.delete_session(session_id)
 
 
 @mcp.tool()
+@tool_tenant
 async def chat(
     session_id: str,
     query: str,
     knowledge_base_ids: list[str] | None = None,
     web_search_enabled: bool = False,
+    tenant_id: TenantID | None = None,
 ) -> dict:
     """RAG pipeline chat: retrieve relevant chunks from knowledge bases, then summarise with LLM.
 
@@ -874,12 +942,14 @@ async def chat(
 
 
 @mcp.tool()
+@tool_tenant
 async def agent_chat(
     session_id: str,
     query: str,
     agent_id: str,
     knowledge_base_ids: list[str] | None = None,
     web_search_enabled: bool = False,
+    tenant_id: TenantID | None = None,
 ) -> dict:
     """Agentic pipeline chat: the agent autonomously calls tools (knowledge_search, web_search, SQL, etc.).
 
@@ -945,7 +1015,8 @@ async def agent_chat(
 
 
 @mcp.tool()
-def list_agents(page: int = 1, page_size: int = 50) -> dict:
+@tool_tenant
+def list_agents(page: int = 1, page_size: int = 50, tenant_id: TenantID | None = None) -> dict:
     """List all custom agents available to the current tenant.
 
     Use this to discover agent IDs, names, and their KB selection mode before
@@ -955,7 +1026,8 @@ def list_agents(page: int = 1, page_size: int = 50) -> dict:
 
 
 @mcp.tool()
-def get_agent(agent_id: str) -> dict:
+@tool_tenant
+def get_agent(agent_id: str, tenant_id: TenantID | None = None) -> dict:
     """Get full configuration of a single agent by UUID or name.
 
     Check kb_selection_mode and knowledge_bases fields: if kb_selection_mode is
@@ -967,19 +1039,22 @@ def get_agent(agent_id: str) -> dict:
 
 
 @mcp.tool()
-def list_chunks(knowledge_id: str, page: int = 1, page_size: int = 20) -> dict:
+@tool_tenant
+def list_chunks(knowledge_id: str, page: int = 1, page_size: int = 20, tenant_id: TenantID | None = None) -> dict:
     """List chunks (text segments) of a knowledge entry."""
     return client.list_chunks(knowledge_id, page, page_size)
 
 
 @mcp.tool()
-def delete_chunk(knowledge_id: str, chunk_id: str) -> dict:
+@tool_tenant
+def delete_chunk(knowledge_id: str, chunk_id: str, tenant_id: TenantID | None = None) -> dict:
     """Delete a chunk."""
     return client.delete_chunk(knowledge_id, chunk_id)
 
 
 @mcp.tool()
-def wiki_search(kb_id: str, query: str, limit: int = 10) -> dict:
+@tool_tenant
+def wiki_search(kb_id: str, query: str, limit: int = 10, tenant_id: TenantID | None = None) -> dict:
     """Search wiki pages by full-text query.
 
     Returns matching wiki pages with title, slug, summary, and content snippets.
@@ -988,7 +1063,8 @@ def wiki_search(kb_id: str, query: str, limit: int = 10) -> dict:
 
 
 @mcp.tool()
-def wiki_read_page(kb_id: str, slug: str) -> dict:
+@tool_tenant
+def wiki_read_page(kb_id: str, slug: str, tenant_id: TenantID | None = None) -> dict:
     """Read a wiki page by its slug.
 
     Returns full markdown content, metadata, inbound/outbound links, and source
@@ -998,7 +1074,8 @@ def wiki_read_page(kb_id: str, slug: str) -> dict:
 
 
 @mcp.tool()
-def wiki_index_view(kb_id: str, limit: int = 50) -> dict:
+@tool_tenant
+def wiki_index_view(kb_id: str, limit: int = 50, tenant_id: TenantID | None = None) -> dict:
     """Get a structured wiki index with per-type directory groups.
 
     Returns an overview of all wiki pages organized by type (entity, concept,

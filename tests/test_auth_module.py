@@ -258,10 +258,14 @@ class RequestScopedAuthModuleTests(unittest.IsolatedAsyncioTestCase):
         def blocked_tool() -> dict:
             return {}
 
+        @test_server.tool(name="list_tenants")
+        def discovery_tool() -> dict:
+            return {}
+
         await apply_read_only_tool_policy(test_server, enabled=True)
 
         names = [tool.name for tool in await test_server.list_tools()]
-        self.assertEqual(["list_knowledge_bases"], names)
+        self.assertEqual(["list_knowledge_bases", "list_tenants"], names)
 
     async def test_client_proxy_delegates_to_request_scoped_provider(self):
         class Client:

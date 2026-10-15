@@ -39,17 +39,29 @@ v0.8.0 的真实协议、读写、检索、对话及权限验证结果见
 调用 `list_tenants(all_spaces=true)` 可枚举所有空间，Key 需包含 `system_tenants_read`
 或 `system_tenants_manage`。默认 `list_tenants()` 保留原来的当前空间列表行为。
 
-读取知识库时，在**每个 MCP HTTP 请求**中增加 `X-Tenant-ID: <空间ID>`，例如：
+单连接跨空间使用：先调用 `list_tenants(all_spaces=true)`，然后将返回的空间 ID 作为
+工具可选参数 `tenant_id`，例如 `list_knowledge_bases(tenant_id=10000)`、
+`hybrid_search(kb_id="<库ID>", query="<问题>", tenant_id=10000)`。
+29 个空间相关工具均提供此参数，包括文档/分块读取、问答、智能体及已有管理工具；
+只有全局 `create_tenant` 不需要它。参数严格接受正 uint64 整数，并由后端逐次核验 Key 权限。
+
+MCP 初始化会提供发现指引：用户未指定空间时，Codex 自行枚举空间与候选知识库，
+选择相关来源检索并标注来源；用户无需提供空间或知识库 ID。工具能力仍由 Key 决定。
+
+Codex 单连接配置见 [`examples/codex-platform-key.toml`](examples/codex-platform-key.toml)。
+此配置不设置固定空间头，只启用枚举和知识库读取/检索工具，Key 从环境变量读取。
+
+保留固定空间连接的用法：在 MCP HTTP 请求中增加 `X-Tenant-ID: <空间ID>`，例如：
 
 ```text
 Authorization: Bearer <平台 API Key>
 X-Tenant-ID: 10000
 ```
 
-通过 `list_knowledge_bases()` 读取该空间的知识库；其他知识库工具使用同一空间上下文。
-遍历全平台时，逐请求更换空间头；固定请求头的客户端可按空间配置多个连接，复用同一个 Key。
+省略 `tenant_id` 时，工具使用该请求头；显式 `tenant_id` 优先于请求头，且只影响当前工具调用。
+同一连接连续或并发调用不同空间时，无需改配置、重连或变更 API Key。
 Key 仍需具有相应能力（读取为 `retrieve`），知识库范围仍由 WeKnora 后端校验。
-空间 Key 不能借此切换到其他空间。目标空间在请求任务与同步工具线程中隔离，
+空间 Key 不能借此切换到其他空间。目标空间在请求、工具调用及同步工具线程中隔离，
 验证缓存按 Key 和空间的组合分开保存，重复、非法或超出 uint64 范围的空间头会被拒绝。
 
 请求链路：

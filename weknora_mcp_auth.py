@@ -12,6 +12,7 @@ import secrets
 import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -26,6 +27,7 @@ AUTH_MODE_SHARED_SECRET = "shared_secret"
 AUTH_MODE_WEKNORA_API_KEY = "weknora_api_key"
 READ_ONLY_TOOL_NAMES = frozenset(
     {
+        "list_tenants",
         "list_knowledge_bases",
         "list_shared_knowledge_bases",
         "get_knowledge_base",
@@ -184,6 +186,29 @@ class RequestScopedClientProvider:
         if self.request_scoped_mode():
             raise PermissionError("No request-scoped WeKnora API key is available")
         return self.static_client
+
+    @contextmanager
+    def use_tenant(self, tenant_id: int | None):
+        """Give one tool call its own client, restoring the outer HTTP context."""
+        if tenant_id is None:
+            yield
+            return
+        if type(tenant_id) is not int or not 0 < tenant_id < 2**64:
+            raise ValueError("tenant_id must be a positive uint64 integer")
+        outer = _REQUEST_AUTH_CONTEXT.get()
+        if outer is None and self.request_scoped_mode():
+            raise PermissionError("No request-scoped WeKnora API key is available")
+        api_key = outer.api_key if outer else self.static_client.api_key
+        token = bind_request_api_key(api_key, str(tenant_id))
+        context = _REQUEST_AUTH_CONTEXT.get()
+        try:
+            yield
+        finally:
+            try:
+                if context.client is not None:
+                    context.client.close()
+            finally:
+                reset_request_api_key(token)
 
 
 class RequestScopedClientProxy:

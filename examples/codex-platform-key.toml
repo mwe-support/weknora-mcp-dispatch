@@ -1,0 +1,17 @@
+# Merge into ~/.codex/config.toml. The environment variable contains the raw Key.
+# CLI: start Codex from the shell that has WEKNORA_PLATFORM_API_KEY set.
+# Desktop: provide the variable to the desktop process, then restart/reload MCP.
+# No fixed X-Tenant-ID is needed: Codex discovers IDs and sends tenant_id per tool.
+[mcp_servers.weknora]
+url = "https://kb.mwexk.com/mcp"
+bearer_token_env_var = "WEKNORA_PLATFORM_API_KEY"
+enabled_tools = [
+  "list_tenants",
+  "list_knowledge_bases",
+  "list_shared_knowledge_bases",
+  "get_knowledge_base",
+  "hybrid_search",
+  "list_knowledge",
+  "get_knowledge",
+  "list_chunks",
+]
