@@ -29,6 +29,7 @@ from weknora_mcp_auth import (
     RequestScopedClientProxy,
     WeKnoraAPIKeyValidator,
     apply_read_only_tool_policy,
+    current_request_tenant_id,
 )
 
 # Set up logging configuration for the MCP server
@@ -93,10 +94,11 @@ def _normalize_kb_entries(resp: object) -> list[Dict]:
 class WeKnoraClient:
     """Client for interacting with WeKnora API"""
 
-    def __init__(self, base_url: str, api_key: str):
+    def __init__(self, base_url: str, api_key: str, tenant_id: str = ""):
         """Initialize the WeKnora API client with base URL and authentication"""
         self.base_url = base_url
         self.api_key = api_key
+        self.tenant_id = tenant_id
         # SSL verification: enabled by default. Set WEKNORA_VERIFY_SSL=false to disable
         # (e.g. for self-signed certs in dev environments — NOT recommended for production).
         self.verify_ssl = os.getenv("WEKNORA_VERIFY_SSL", "true").lower() != "false"
@@ -121,6 +123,8 @@ class WeKnoraClient:
                 "Content-Type": "application/json",
             }
         )
+        if self.tenant_id:
+            session.headers["X-Tenant-ID"] = self.tenant_id
         with self._sessions_lock:
             self._sessions.add(session)
         return session
@@ -181,9 +185,9 @@ class WeKnoraClient:
         """Get tenant information"""
         return self._request("GET", f"/tenants/{tenant_id}")
 
-    def list_tenants(self) -> Dict:
+    def list_tenants(self, all_spaces: bool = False) -> Dict:
         """List all tenants"""
-        return self._request("GET", "/tenants")
+        return self._request("GET", "/tenants/all" if all_spaces else "/tenants")
 
     # Knowledge Base Management - Methods for managing knowledge bases
     def create_knowledge_base(self, name: str, description: str, config: Dict) -> Dict:
@@ -600,7 +604,9 @@ mcp = MCPServer("weknora-server", version="1.1.1")
 _STATIC_CLIENT = WeKnoraClient(WEKNORA_BASE_URL, WEKNORA_API_KEY)
 _CLIENT_PROVIDER = RequestScopedClientProvider(
     static_client=_STATIC_CLIENT,
-    client_factory=lambda api_key: WeKnoraClient(WEKNORA_BASE_URL, api_key),
+    client_factory=lambda api_key: WeKnoraClient(
+        WEKNORA_BASE_URL, api_key, tenant_id=current_request_tenant_id()
+    ),
     request_scoped_mode=lambda: AUTH_SETTINGS.request_scoped,
 )
 client = RequestScopedClientProxy(_CLIENT_PROVIDER)
@@ -636,9 +642,9 @@ def create_tenant(
 
 
 @mcp.tool()
-def list_tenants() -> dict:
-    """List all tenants."""
-    return client.list_tenants()
+def list_tenants(all_spaces: bool = False) -> dict:
+    """List workspaces. all_spaces=True requires a platform key with system_tenants_read or system_tenants_manage."""
+    return client.list_tenants(all_spaces=all_spaces)
 
 
 @mcp.tool()

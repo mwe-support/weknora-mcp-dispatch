@@ -33,6 +33,25 @@ v0.8.0 的真实协议、读写、检索、对话及权限验证结果见
   生产 Compose 将专用宿主机目录只读挂载到 `/uploads`，不允许扫描容器工作目录。
 - 保留上游 `shared_secret` 和 stdio 模式，便于兼容原有部署。
 
+### 平台 API Key 与目标空间
+
+平台 Key 使用同样的 `Authorization: Bearer <Key>`。初始化和工具目录发现无需指定空间；
+调用 `list_tenants(all_spaces=true)` 可枚举所有空间，Key 需包含 `system_tenants_read`
+或 `system_tenants_manage`。默认 `list_tenants()` 保留原来的当前空间列表行为。
+
+读取知识库时，在**每个 MCP HTTP 请求**中增加 `X-Tenant-ID: <空间ID>`，例如：
+
+```text
+Authorization: Bearer <平台 API Key>
+X-Tenant-ID: 10000
+```
+
+通过 `list_knowledge_bases()` 读取该空间的知识库；其他知识库工具使用同一空间上下文。
+遍历全平台时，逐请求更换空间头；固定请求头的客户端可按空间配置多个连接，复用同一个 Key。
+Key 仍需具有相应能力（读取为 `retrieve`），知识库范围仍由 WeKnora 后端校验。
+空间 Key 不能借此切换到其他空间。目标空间在请求任务与同步工具线程中隔离，
+验证缓存按 Key 和空间的组合分开保存，重复、非法或超出 uint64 范围的空间头会被拒绝。
+
 请求链路：
 
 ```text
@@ -41,9 +60,9 @@ MCP client
   └─ Authorization: Bearer <WeKnora API Key>
           ↓
 WeKnora MCP Dispatch
-  ├─ GET /knowledge-bases 验证 Key
-  ├─ 绑定当前请求身份
-  └─ X-API-Key 转发至 WeKnora API
+  ├─ GET /knowledge-bases 验证 Key，同时携带可选 X-Tenant-ID
+  ├─ 绑定当前请求身份与目标空间
+  └─ X-API-Key / X-Tenant-ID 转发至 WeKnora API
 ```
 
 ## 生产 Docker 配置

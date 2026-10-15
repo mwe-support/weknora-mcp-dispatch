@@ -129,6 +129,7 @@ class AuthSettings:
 @dataclass
 class RequestAuthContext:
     api_key: str
+    tenant_id: str = ""
     client: Any | None = None
     client_lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -144,9 +145,15 @@ def current_request_api_key() -> str:
     return context.api_key if context else ""
 
 
-def bind_request_api_key(api_key: str):
+def current_request_tenant_id() -> str:
+    """Return the target workspace bound to this authenticated request."""
+    context = _REQUEST_AUTH_CONTEXT.get()
+    return context.tenant_id if context else ""
+
+
+def bind_request_api_key(api_key: str, tenant_id: str = ""):
     """Bind an API key to the current async context and return its reset token."""
-    return _REQUEST_AUTH_CONTEXT.set(RequestAuthContext(api_key))
+    return _REQUEST_AUTH_CONTEXT.set(RequestAuthContext(api_key, tenant_id))
 
 
 def reset_request_api_key(token) -> None:
@@ -212,8 +219,8 @@ class WeKnoraAPIKeyValidator:
         self._semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
     @staticmethod
-    def _fingerprint(api_key: str) -> str:
-        return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    def _fingerprint(api_key: str, tenant_id: str = "") -> str:
+        return hashlib.sha256(f"{api_key}\0{tenant_id}".encode("utf-8")).hexdigest()
 
     def _cache_result(self, fingerprint: str, expires_at: float, valid: bool) -> None:
         now = time.monotonic()
@@ -228,18 +235,21 @@ class WeKnoraAPIKeyValidator:
                 self._cache.pop(next(iter(self._cache)))
             self._cache[fingerprint] = (expires_at, valid)
 
-    def validate_sync(self, api_key: str) -> bool | None:
-        fingerprint = self._fingerprint(api_key)
+    def validate_sync(self, api_key: str, tenant_id: str = "") -> bool | None:
+        fingerprint = self._fingerprint(api_key, tenant_id)
         now = time.monotonic()
         with self._cache_lock:
             cached = self._cache.get(fingerprint)
         if cached and cached[0] > now:
             return cached[1]
 
+        headers = {"X-API-Key": api_key, "Accept": "application/json"}
+        if tenant_id:
+            headers["X-Tenant-ID"] = tenant_id
         try:
             response = self.request_get(
                 f"{self.base_url}/knowledge-bases",
-                headers={"X-API-Key": api_key, "Accept": "application/json"},
+                headers=headers,
                 timeout=(3, 10),
                 verify=self.verify_ssl,
             )
@@ -249,6 +259,13 @@ class WeKnoraAPIKeyValidator:
 
         if 200 <= response.status_code < 300:
             valid = True
+        elif response.status_code == 409 and not tenant_id:
+            # WeKnora emits this code only after authenticating a platform key.
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+            valid = isinstance(body, dict) and body.get("code") == "TENANT_REQUIRED"
         elif response.status_code in {408, 425, 429}:
             logger.warning(
                 "WeKnora API key validation was limited with status %d",
@@ -268,14 +285,14 @@ class WeKnoraAPIKeyValidator:
         self._cache_result(fingerprint, now + ttl, valid)
         return valid
 
-    async def __call__(self, api_key: str) -> bool | None:
+    async def __call__(self, api_key: str, tenant_id: str = "") -> bool | None:
         try:
             await asyncio.wait_for(self._semaphore.acquire(), timeout=1.0)
         except TimeoutError:
             logger.warning("WeKnora API key validation concurrency limit reached")
             return None
         try:
-            return await asyncio.to_thread(self.validate_sync, api_key)
+            return await asyncio.to_thread(self.validate_sync, api_key, tenant_id)
         finally:
             self._semaphore.release()
 
@@ -297,7 +314,7 @@ class MCPAuthMiddleware:
         app,
         token: str,
         auth_mode: str = AUTH_MODE_SHARED_SECRET,
-        api_key_validator: Callable[[str], Awaitable[bool | None]] | None = None,
+        api_key_validator: Callable[..., Awaitable[bool | None]] | None = None,
     ):
         self.app = app
         self.token = token
@@ -352,10 +369,32 @@ class MCPAuthMiddleware:
             return
 
         if self.auth_mode == AUTH_MODE_WEKNORA_API_KEY:
+            tenant_headers = [
+                value.decode("latin-1").strip()
+                for name, value in scope.get("headers", [])
+                if name.lower() == b"x-tenant-id"
+            ]
+            tenant_id = ""
+            if tenant_headers:
+                candidate = tenant_headers[0]
+                if (
+                    len(tenant_headers) != 1
+                    or not 1 <= len(candidate) <= 20
+                    or not candidate.isascii()
+                    or not candidate.isdigit()
+                    or not 0 < int(candidate) < 2**64
+                ):
+                    await self._send_error(send, 400, "invalid_tenant_id")
+                    return
+                tenant_id = str(int(candidate))
             if self.api_key_validator is None:
                 await self._send_error(send, 500, "invalid_server_auth_mode")
                 return
-            validation = await self.api_key_validator(provided)
+            validation = (
+                await self.api_key_validator(provided, tenant_id)
+                if tenant_id
+                else await self.api_key_validator(provided)
+            )
             if validation is None:
                 await self._send_error(send, 503, "authentication_service_unavailable")
                 return
@@ -363,7 +402,7 @@ class MCPAuthMiddleware:
                 await self._send_error(send, 403, "invalid_or_unscoped_api_key")
                 return
 
-            context_token = bind_request_api_key(provided)
+            context_token = bind_request_api_key(provided, tenant_id)
             request_context = _REQUEST_AUTH_CONTEXT.get()
             try:
                 await self.app(scope, receive, send)
